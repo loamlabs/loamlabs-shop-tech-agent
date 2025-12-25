@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { google } from '@ai-sdk/google';
-import { streamText, tool, convertToCoreMessages } from 'ai';
+import { streamText, tool } from 'ai'; // Removed convertToCoreMessages to fix import error
 import { z } from 'zod';
 
 // Ensure we are using Node runtime for manual response piping
@@ -102,7 +102,7 @@ async function lookupProductInfo(query: string) {
 }
 
 export default async function handler(req: any, res: any) {
-  // CORS Headers - Vital for Shopify Frontend
+  // CORS Headers
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
@@ -119,11 +119,13 @@ export default async function handler(req: any, res: any) {
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
     const result = await streamText({
-      // FIXED: Removed 'models/' prefix. The SDK handles this.
-      // If this still fails, your Google Cloud Project might require 'gemini-1.5-flash-001'
-      model: google('gemini-1.5-flash'), 
+      model: google('gemini-1.5-flash'),
       system: finalSystemPrompt,
-      messages: convertToCoreMessages(messages),
+      // FIXED: Manual message mapping removes dependency on 'convertToCoreMessages'
+      messages: messages.map((m: any) => ({
+        role: m.role,
+        content: m.content
+      })),
       maxSteps: 5,
       tools: {
         lookup_product_info: tool({
@@ -156,14 +158,12 @@ export default async function handler(req: any, res: any) {
       },
     });
 
-    // Initialize Manual Stream Response
     res.writeHead(200, {
       'Content-Type': 'text/plain; charset=utf-8',
       'Transfer-Encoding': 'chunked',
       'Connection': 'keep-alive'
     });
 
-    // Stream Loop
     for await (const part of result.fullStream) {
         if (part.type === 'text-delta') {
             res.write(part.textDelta);
