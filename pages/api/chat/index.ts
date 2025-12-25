@@ -21,9 +21,11 @@ You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 - Identity: "LoamLabs Automated Lead Tech".
 
 **CRITICAL SEARCH RULES:**
-1. **BROADEN THE SCOPE:** If a user asks "What else do you have?", search for **Component Type + Spec** (e.g. "Rear Hub 12x148"). DO NOT assume the previous brand.
-2. **INVENTORY PRECISION:** Parse the tool output carefully. If it lists specific variants in stock, report them.
-3. **LEAD TIME MATH:** In Stock = ~${STANDARD_SHOP_BUILD_DAYS} days. Out of Stock = Mfg Lead Time + ${STANDARD_SHOP_BUILD_DAYS} days.
+1. **SEARCH SIMPLY:** When using the 'lookup_product_info' tool, use ONLY the core Brand or Model name (e.g., "Hydra", "Vesper", "Hydra2"). 
+2. **NO FLUFF:** NEVER include words like "stock", "available", "hub", or "price" in the search query. They break the search engine.
+3. **INVENTORY PRECISION:** Parse the tool output carefully. If it lists specific variants in stock, report them.
+4. **LEAD TIME MATH:** In Stock = ~${STANDARD_SHOP_BUILD_DAYS} days. Out of Stock = Mfg Lead Time + ${STANDARD_SHOP_BUILD_DAYS} days.
+5. **ALWAYS REPLY:** Even if the tool returns "No products found", you MUST tell the user "I couldn't find anything matching [Term]. Did you mean...?"
 
 **CONTEXT:**
 The user's current selections are injected. If they ask about something NOT selected, use the 'lookup_product_info' tool.
@@ -67,7 +69,15 @@ async function lookupProductInfo(query: string) {
     });
 
     const data = await adminResponse.json();
-    if (!data.data || !data.data.products) return "Search failed or returned no data.";
+    
+    // Debug Log for Shopify Response
+    if (!data.data || !data.data.products) {
+        console.error("[Shopify Error] Invalid Data:", JSON.stringify(data));
+        return "Search failed. The store database returned an error.";
+    }
+    
+    const count = data.data.products.edges.length;
+    console.log(`[Shopify] Found ${count} products for query "${query}"`);
 
     const products = data.data.products.edges.map((e: any) => {
       const p = e.node;
@@ -85,7 +95,7 @@ async function lookupProductInfo(query: string) {
       return `ITEM: ${p.title} | ${stockSummary} | Mfg Lead Time: ${rawLeadTime} days`;
     });
 
-    if (products.length === 0) return "No products found matching that query.";
+    if (products.length === 0) return "No products found matching that query. Try a simpler search term.";
     return products.join("\n");
 
   } catch (error) {
@@ -122,22 +132,26 @@ export default async function handler(req: any, res: any) {
         lookup_product_info: tool({
           description: 'Searches the store inventory for products.',
           parameters: z.object({ 
-            query: z.string().describe("A SINGLE search string combining Brand, Model, and Spec (e.g. 'Industry Nine Hydra Rear').") 
+            query: z.string().describe("The core Brand or Model name to search for (e.g. 'Hydra'). DO NOT include words like 'stock', 'available', or 'hub'.") 
           }),
-          // FIXED: Intelligent Argument Reconstruction
           execute: async (args) => {
             console.log("[Tool Debug] Raw Args:", JSON.stringify(args));
             
             let q = args.query;
             
-            // If AI split the args (e.g. { brand: 'I9', model: 'Hydra' }), join them back together
+            // Intelligent Argument Reconstruction
             if (!q || typeof q !== 'string') {
                 q = Object.values(args)
                     .filter(v => v && typeof v === 'string' && v.trim().length > 0)
                     .join(" ");
             }
             
-            // Fallback
+            // CLEANUP: Remove common "fluff" words that break Shopify search
+            if (q) {
+                // Remove "stock", "available", "hub", "hubs", "in" (case insensitive)
+                q = q.replace(/\b(stock|available|hub|hubs|pair|set|in)\b/gi, '').trim();
+            }
+            
             if (!q) q = "undefined";
             
             return await lookupProductInfo(String(q));
@@ -178,12 +192,7 @@ export default async function handler(req: any, res: any) {
     let hasSentText = false;
 
     for await (const part of result.fullStream) {
-        if (part.type === 'text-delta') {
-            // console.log("DEBUG PART:", JSON.stringify(part));
-        }
-
         const textContent = part.textDelta || part.text || part.content || "";
-        
         if (part.type === 'text-delta' && typeof textContent === 'string' && textContent.length > 0) {
             res.write(textContent);
             hasSentText = true;
