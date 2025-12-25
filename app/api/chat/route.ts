@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { google } from '@ai-sdk/google';
-import { streamText, tool } from 'ai';
+import { streamText, tool, convertToCoreMessages } from 'ai';
 import { z } from 'zod';
 
 export const maxDuration = 60;
@@ -41,8 +41,6 @@ export async function POST(req: Request) {
   try {
     const { messages, buildContext } = await req.json();
 
-    console.log("Incoming Request Context:", buildContext ? "Present" : "Missing");
-
     const contextInjection = `
       [CURRENT BUILD STATE]:
       - Step: ${buildContext?.step || 'Unknown'}
@@ -54,10 +52,10 @@ export async function POST(req: Request) {
       - Estimated Shop Lead Time: ${buildContext?.leadTime || 'Standard'} Days
     `;
 
-    const result = streamText({
+    const result = await streamText({
       model: google('models/gemini-1.5-flash'),
       system: SYSTEM_PROMPT + contextInjection,
-      messages: messages,
+      messages: convertToCoreMessages(messages), // Fixes the "Invalid Prompt" error
       tools: {
         check_live_inventory: tool({
           description: 'Checks the real-time stock quantity of a specific product variant.',
@@ -122,11 +120,10 @@ export async function POST(req: Request) {
       },
     });
 
-    return result.toAIStreamResponse();
+    return result.toTextStreamResponse(); // The correct method for SDK v3.4
 
   } catch (error: any) {
     console.error("AI ROUTE ERROR:", error);
-    // Return the actual error message to the frontend so we can debug
     return new Response(JSON.stringify({ error: error.message }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' },
