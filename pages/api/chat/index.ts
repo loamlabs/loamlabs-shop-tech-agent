@@ -119,7 +119,6 @@ export default async function handler(req: any, res: any) {
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
     const result = await streamText({
-      // UPDATED: Using a model CONFIRMED to exist in your diagnostic list
       model: google('gemini-2.0-flash-001'),
       system: finalSystemPrompt,
       messages: messages.map((m: any) => ({
@@ -129,16 +128,22 @@ export default async function handler(req: any, res: any) {
       maxSteps: 5,
       tools: {
         lookup_product_info: tool({
-          description: 'Searches the store. Query should be the Product Name or Spec (e.g. "Rear Hub 12x148").',
-          parameters: z.object({ query: z.string() }),
+          description: 'Searches the store inventory for products.',
+          parameters: z.object({ 
+            query: z.string().describe("The name or specification of the component to search for (e.g. 'Onyx Vesper', 'Rear Hub 12x148')") 
+          }),
           execute: async ({ query }) => await lookupProductInfo(query),
         }),
         calculate_spoke_lengths: tool({
-          description: 'Calculates precise spoke lengths.',
+          description: 'Calculates precise spoke lengths based on hub and rim geometry.',
           parameters: z.object({
-            erd: z.number(), pcdLeft: z.number(), pcdRight: z.number(),
-            flangeLeft: z.number(), flangeRight: z.number(),
-            spokeCount: z.number(), crossPattern: z.number()
+            erd: z.number().describe("Effective Rim Diameter in mm"), 
+            pcdLeft: z.number().describe("Pitch Circle Diameter of left flange"), 
+            pcdRight: z.number().describe("Pitch Circle Diameter of right flange"),
+            flangeLeft: z.number().describe("Flange offset left"), 
+            flangeRight: z.number().describe("Flange offset right"),
+            spokeCount: z.number().describe("Total number of spokes"), 
+            crossPattern: z.number().describe("Spoke crossing pattern (e.g. 3)")
           }),
           execute: async (args) => {
             try {
