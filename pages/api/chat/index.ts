@@ -14,34 +14,33 @@ const openai = new OpenAI({
 
 const STANDARD_SHOP_BUILD_DAYS = 5;
 
-const BASE_SYSTEM_PROMPT = `
+const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 
 **YOUR PERSONALITY:**
 - Professional, technical, direct, and "down to earth."
 - Identity: "LoamLabs Automated Lead Tech".
 
-**CRITICAL STORE POLICIES:**
-1. **PRICE IS TRUTH:** If price > $0.00, it is not free.
-2. **SCOPE BOUNDARY:** Only discuss products found via tools or context.
-3. **INVENTORY REALITY:** Never guess stock. Use 'lookup_product_info'.
-   - **Math:** (Mfg Lead Time) + (${STANDARD_SHOP_BUILD_DAYS} days Shop Time) = Total Estimate.
+**CRITICAL BEHAVIOR RULES:**
+1. **PROACTIVITY:** If a user asks "What else do you have?", **DO NOT GUESS.**
+   - First, check if you know their **Axle Spacing** (e.g. 15x110) and **Brake Style** (e.g. 6-Bolt).
+   - If you don't know, **ASK THEM FIRST**. (e.g., "To check stock accurately, do you need Boost (15x110) or Standard (12x100) spacing?").
+   - Only run the search *after* you know what fits their bike.
 
-**INTELLIGENT SEARCHING (CRITICAL):**
-1. **MAINTAIN CONTEXT:** If the user asks "What do you have in stock?" or "What is faster?", you MUST infer the **Component Type** from the previous conversation.
-   - *Bad:* Searching for "in stock fast".
-   - *Good:* Searching for "Rear Hub" or "DT Swiss Hub" (if the user was just talking about hubs).
-2. **RELEVANCY:** If the user is discussing Hubs, DO NOT recommend Rims or Spokes.
-3. **NO REPETITION:** Do not repeat the full specs/lead times of products you *just* listed in your last message. Summarize or move on to new suggestions.
+2. **INVENTORY PRECISION:** 
+   - The search tool returns a list of *specific variants* that are in stock.
+   - Do NOT say "DT Swiss 180 is out of stock" just because *some* are out.
+   - Look closely at the tool output. If it says "IN STOCK VARIANTS: 12x100", tell the user: "I have the 12x100 version in stock, but the 15x110 is special order."
 
-**TECHNICAL CHEAT SHEET:**
-- Hydra2 = Industry Nine Hydra.
-- Onyx Vesper: Instant engagement, Silent.
-- DT Swiss 350: Ratchet, reliable.
-- Sapim CX-Ray: Bladed aero.
+3. **LEAD TIME MATH:**
+   - **In Stock Items:** ~${STANDARD_SHOP_BUILD_DAYS} business days to build.
+   - **Out of Stock:** (Mfg Lead Time from Tool) + (${STANDARD_SHOP_BUILD_DAYS} days Shop Time).
+
+**SEARCHING:** 
+- If specific search fails (e.g. "Hydra2"), try broad terms like "Industry Nine" or "DT Swiss".
 `;
 
-// 2. SHOPIFY TOOL FUNCTION
+// 2. SHOPIFY TOOL FUNCTION (Advanced Variant Analysis)
 async function lookupProductInfo(query: string) {
   console.log(`[Tool] Searching Shopify for: "${query}"`);
   try {
@@ -54,19 +53,20 @@ async function lookupProductInfo(query: string) {
         body: JSON.stringify({
             query: `
               query searchProducts($query: String!) {
-                products(first: 5, query: $query) {
+                products(first: 15, query: $query) {
                   edges {
                     node {
                       title
                       totalInventory
                       leadTime: metafield(namespace: "custom", key: "lead_time_days") { value }
-                      variants(first: 5) {
+                      variants(first: 25) {
                         edges {
                           node {
                             title
                             inventoryPolicy
                             inventoryQuantity
                             price
+                            selectedOptions { name value }
                           }
                         }
                       }
@@ -85,26 +85,37 @@ async function lookupProductInfo(query: string) {
     const products = data.data.products.edges.map((e: any) => {
       const p = e.node;
       const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 0;
-      const totalLeadTime = rawLeadTime + STANDARD_SHOP_BUILD_DAYS;
       
-      // Calculate total stock across variants
-      const totalVariantStock = p.variants.edges.reduce((sum: number, v: any) => sum + v.node.inventoryQuantity, 0);
-      const isContinue = p.variants.edges.some((v: any) => v.node.inventoryPolicy === 'continue');
+      // Analyze Variants
+      const inStockVariants: string[] = [];
+      const outOfStockVariants: string[] = [];
       
-      let status = "In Stock";
-      if (totalVariantStock <= 0) {
-          status = isContinue ? `Special Order` : "Sold Out";
+      p.variants.edges.forEach((v: any) => {
+          const node = v.node;
+          // Get useful specs from title or options
+          const name = node.title.replace('Default Title', 'Standard');
+          
+          if (node.inventoryQuantity > 0) {
+              inStockVariants.push(`${name} (Qty: ${node.inventoryQuantity})`);
+          } else if (node.inventoryPolicy === 'continue') {
+              outOfStockVariants.push(name);
+          }
+      });
+
+      let stockSummary = "";
+      if (inStockVariants.length > 0) {
+          stockSummary = `> IN STOCK VARIANTS: ${inStockVariants.join(', ')}`;
+      } else {
+          stockSummary = "> ALL VARIANTS OUT OF STOCK (Special Order Only)";
       }
 
-      return `Product: ${p.title}
-      Status: ${status}
-      Total Stock: ${totalVariantStock}
-      Mfg Lead Time (metafield: custom.lead_time_days): ${rawLeadTime} days
-      Est. Customer Arrival: ~${totalLeadTime} days from order`;
+      return `PRODUCT: ${p.title}
+      Mfg Lead Time: ${rawLeadTime} days
+      ${stockSummary}`;
     });
 
     if (products.length === 0) return "No products found matching that query.";
-    return products.join("\n\n----------------\n\n");
+    return products.join("\n\n");
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
@@ -114,7 +125,7 @@ async function lookupProductInfo(query: string) {
 
 // 3. MAIN HANDLER
 export default async function handler(req: any, res: any) {
-  // CORS
+  // CORS Headers
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
@@ -133,21 +144,18 @@ export default async function handler(req: any, res: any) {
       ${JSON.stringify(buildContext?.components || {})}
     `;
 
-    let finalSystemPrompt = BASE_SYSTEM_PROMPT + contextInjection;
-    
+    let finalSystemPrompt = SYSTEM_PROMPT + contextInjection;
+
     if (isAdmin) {
-        finalSystemPrompt += `
-        
-        *** ADMIN DEBUG MODE ACTIVE (User is Staff) ***
-        1. If asked about data sources, explicitly state the Metafield Key used (custom.lead_time_days).
-        2. If asked "Why did you say that?", explain your reasoning (e.g. "I saw 0 stock and 10 day lead time in the tool output").
-        3. You may show raw data snippets if requested.
-        `;
+        finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
     }
 
     const openAiMessages = [
       { role: 'system', content: finalSystemPrompt },
-      ...messages.map((m: any) => ({ role: m.role === 'agent' ? 'assistant' : m.role, content: m.content }))
+      ...messages.map((m: any) => ({ 
+        role: m.role === 'agent' ? 'assistant' : m.role, 
+        content: m.content 
+      }))
     ];
 
     const tools = [
@@ -155,7 +163,7 @@ export default async function handler(req: any, res: any) {
         type: "function",
         function: {
           name: "lookup_product_info",
-          description: "Searches the store. IMPORTANT: Include the Component Type in your query (e.g. 'Onyx Hub' or 'Rear Hub') to avoid irrelevant results.",
+          description: "Searches the store. Query should be the Product Name or Category (e.g. 'DT Swiss Hubs', 'Rear Hub').",
           parameters: {
             type: "object",
             properties: { query: { type: "string" } },
@@ -167,7 +175,7 @@ export default async function handler(req: any, res: any) {
         type: "function",
         function: {
           name: "calculate_spoke_lengths",
-          description: "Calculates spoke lengths.",
+          description: "Calculates precise spoke lengths.",
           parameters: {
             type: "object",
             properties: {
