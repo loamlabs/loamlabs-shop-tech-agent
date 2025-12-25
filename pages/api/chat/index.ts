@@ -1,7 +1,7 @@
 // @ts-nocheck
 import OpenAI from 'openai';
+import { z } from 'zod';
 
-// 1. CONFIGURATION
 export const config = {
   api: {
     bodyParser: true,
@@ -12,9 +12,9 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-const STANDARD_SHOP_BUILD_DAYS = 5; // LoamLabs internal build buffer
+const STANDARD_SHOP_BUILD_DAYS = 5;
 
-const SYSTEM_PROMPT = `
+const BASE_SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 You are speaking to a customer in the Custom Wheel Builder.
 
@@ -46,7 +46,7 @@ You are speaking to a customer in the Custom Wheel Builder.
 The user's current build configuration (Rims, Hubs, Specs, Prices, Lead Times) is injected into your first message. Use this data to answer specific questions.
 `;
 
-// 2. SHOPIFY TOOL FUNCTION (Server-Side)
+// 2. SHOPIFY TOOL FUNCTION
 async function lookupProductInfo(query: string) {
   try {
     const adminResponse = await fetch(`https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-04/graphql.json`, {
@@ -84,34 +84,25 @@ async function lookupProductInfo(query: string) {
     });
 
     const data = await adminResponse.json();
-    
-    if (!data.data || !data.data.products) {
-        return "Search failed or returned no data.";
-    }
+    if (!data.data || !data.data.products) return "Search failed or returned no data.";
 
     const products = data.data.products.edges.map((e: any) => {
       const p = e.node;
-      // Get Lead Time (Default to 0 if missing)
       const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 0;
       const totalLeadTime = rawLeadTime + STANDARD_SHOP_BUILD_DAYS;
-      
       const variant = p.variants.edges[0]?.node;
       const stock = variant ? variant.inventoryQuantity : 0;
       const policy = variant ? variant.inventoryPolicy : 'deny';
       
       let status = "In Stock";
       if (stock <= 0) {
-          status = policy === 'continue' 
-            ? `Special Order (Mfg Lead Time: ${rawLeadTime} days + ${STANDARD_SHOP_BUILD_DAYS} days build = ~${totalLeadTime} days total)` 
-            : "Sold Out";
-      } else {
-          status = `In Stock (Ships in ~${STANDARD_SHOP_BUILD_DAYS} days)`;
+          status = policy === 'continue' ? `Special Order` : "Sold Out";
       }
 
-      return `Product: ${p.title}\nStatus: ${status}\nStock Level: ${stock}\nMetadata Lead Time: ${rawLeadTime} days`;
+      return `Product: ${p.title}\nStatus: ${status}\nStock: ${stock}\nMfg Lead Time: ${rawLeadTime} days\nCalc Total Lead Time: ~${totalLeadTime} days`;
     });
 
-    if (products.length === 0) return "No products found matching that name.";
+    if (products.length === 0) return "No products found.";
     return products.join("\n\n");
 
   } catch (error) {
@@ -134,34 +125,44 @@ export default async function handler(req: any, res: any) {
   }
 
   try {
-    const { messages, buildContext } = req.body;
+    // Extract isAdmin flag
+    const { messages, buildContext, isAdmin } = req.body;
 
     const contextInjection = `
       [CURRENT USER SELECTIONS]:
       ${JSON.stringify(buildContext?.components || {})}
     `;
 
-    // 1. Prepare Messages
+    // DYNAMIC PROMPT MODIFICATION
+    let finalSystemPrompt = BASE_SYSTEM_PROMPT + contextInjection;
+    
+    if (isAdmin) {
+        finalSystemPrompt += `
+        
+        *** ADMIN MODE ACTIVE ***
+        The user is the STORE OWNER (Admin).
+        1. You may break character if asked.
+        2. If asked "How did you calculate that?", explain the specific math (Mfg Time + Shop Time).
+        3. If asked "Show me the raw data", output the raw text you received from the 'lookup_product_info' tool.
+        4. Be concise and technical.
+        `;
+    }
+
     const openAiMessages = [
-      { role: 'system', content: SYSTEM_PROMPT + contextInjection },
-      ...messages.map((m: any) => ({ 
-        role: m.role === 'agent' ? 'assistant' : m.role, 
-        content: m.content 
-      }))
+      { role: 'system', content: finalSystemPrompt },
+      ...messages.map((m: any) => ({ role: m.role === 'agent' ? 'assistant' : m.role, content: m.content }))
     ];
 
-    // 2. Define Tools Schema
+    // Tool Definition (Same as before)
     const tools = [
       {
         type: "function",
         function: {
           name: "lookup_product_info",
-          description: "Searches the store for a product. Use broad terms if specific ones fail (e.g. 'Hydra' instead of 'Hydra2').",
+          description: "Searches store for product inventory/lead time.",
           parameters: {
             type: "object",
-            properties: {
-              query: { type: "string", description: "Product name to search." },
-            },
+            properties: { query: { type: "string" } },
             required: ["query"],
           },
         },
@@ -170,7 +171,7 @@ export default async function handler(req: any, res: any) {
         type: "function",
         function: {
           name: "calculate_spoke_lengths",
-          description: "Calculates precise spoke lengths using the internal engine.",
+          description: "Calculates spoke lengths.",
           parameters: {
             type: "object",
             properties: {
@@ -188,7 +189,6 @@ export default async function handler(req: any, res: any) {
       }
     ];
 
-    // 3. First Call to OpenAI
     const firstResponse = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: openAiMessages,
@@ -199,20 +199,18 @@ export default async function handler(req: any, res: any) {
     const responseMessage = firstResponse.choices[0].message;
     const toolCalls = responseMessage.tool_calls;
 
-    // 4. Handle Tool Calls
     if (toolCalls) {
       openAiMessages.push(responseMessage);
 
       for (const toolCall of toolCalls) {
         const fnName = toolCall.function.name;
         const args = JSON.parse(toolCall.function.arguments);
-        let functionResponse = "Error executing tool.";
+        let functionResponse = "Error";
 
         if (fnName === "lookup_product_info") {
           functionResponse = await lookupProductInfo(args.query);
-        } 
-        else if (fnName === "calculate_spoke_lengths") {
-          try {
+        } else if (fnName === "calculate_spoke_lengths") {
+           try {
             const apiRes = await fetch(process.env.SPOKE_CALC_API_URL || '', {
               method: 'POST',
               headers: {
@@ -222,10 +220,8 @@ export default async function handler(req: any, res: any) {
               body: JSON.stringify(args),
             });
             const calcData = await apiRes.json();
-            functionResponse = `Calculated Lengths: Left ${calcData.left}mm, Right ${calcData.right}mm.`;
-          } catch (e) {
-            functionResponse = "Error connecting to spoke calculator service.";
-          }
+            functionResponse = `Calculated: Left ${calcData.left}mm, Right ${calcData.right}mm`;
+           } catch(e) { functionResponse = "Calc Error"; }
         }
 
         openAiMessages.push({
@@ -237,7 +233,6 @@ export default async function handler(req: any, res: any) {
       }
     }
 
-    // 5. Final Streaming Response
     res.writeHead(200, {
       'Content-Type': 'text/plain; charset=utf-8',
       'Transfer-Encoding': 'chunked',
