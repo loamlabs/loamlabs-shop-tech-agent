@@ -114,7 +114,6 @@ export default async function handler(req: any, res: any) {
   }
 
   try {
-    // 1. Debug API Key Presence
     const apiKey = process.env.GOOGLE_GENERATIVE_AI_API_KEY;
     if (!apiKey) {
         throw new Error("GOOGLE_GENERATIVE_AI_API_KEY is missing from Vercel Environment Variables");
@@ -126,9 +125,9 @@ export default async function handler(req: any, res: any) {
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
     const result = await streamText({
-      model: google('gemini-1.5-flash'), // Using standard alias
+      // FIXED: Specific version number required for this project configuration
+      model: google('gemini-1.5-flash-001'),
       system: finalSystemPrompt,
-      // Manual message mapping to avoid version conflicts
       messages: messages.map((m: any) => ({
         role: m.role,
         content: m.content
