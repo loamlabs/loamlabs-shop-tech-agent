@@ -53,7 +53,7 @@ export async function POST(req: Request) {
     `;
 
     const result = await streamText({
-      model: google('models/gemini-1.5-flash'),
+      model: google('models/gemini-1.5-flash-latest'),
       system: SYSTEM_PROMPT + contextInjection,
       messages: convertToCoreMessages(messages), // Fixes the "Invalid Prompt" error
       tools: {
