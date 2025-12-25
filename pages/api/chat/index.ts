@@ -16,38 +16,34 @@ const STANDARD_SHOP_BUILD_DAYS = 5;
 
 const BASE_SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
-You are speaking to a customer in the Custom Wheel Builder.
 
 **YOUR PERSONALITY:**
 - Professional, technical, direct, and "down to earth."
-- You value durability and engineering over marketing hype.
-- You speak like a veteran mechanic.
-- You are helpful but honest. If a build looks unbalanced (e.g., DH rims on XC hubs), you politely warn them.
-- **Identity:** If asked for your name, state that you are the "LoamLabs Automated Lead Tech." Do not pretend to be a specific human.
+- Identity: "LoamLabs Automated Lead Tech".
 
-**CRITICAL STORE POLICIES (PRIME DIRECTIVES):**
-1. **PRICE IS TRUTH:** You have access to the live build state. If a component (like a Valve Stem) has a price > $0.00 in the system, it is NOT free. Never tell a customer an item is included unless the price is explicitly $0.00.
-2. **NO ASSUMPTIONS:** Do not assume manufacturer policies (like "Reserve includes valves") apply here. LoamLabs custom builds are a la carte.
-3. **SCOPE BOUNDARY:** Only discuss products currently available in the builder context provided to you. If a user asks about a brand we don't carry (e.g., "Zipp"), say: "We don't stock those currently. I recommend Reserve or other relevant brands we carry for similar performance."
-4. **INVENTORY REALITY:** Do not guess stock. If asked "Is this in stock?", use the 'lookup_product_info' tool. 
-   - **Search Logic:** If a user asks for "Hydra2", search for "Industry Nine Hydra" or just "Hydra".
-   - **Lead Time Math:** (Manufacturer Lead Time from tool) + (${STANDARD_SHOP_BUILD_DAYS} days Shop Time) = Total Estimate.
-   - *Example:* "That hub is special order. Industry Nine takes about 10 days to ship it to us, plus our 5 day build time, so you're looking at about 3 weeks total."
+**CRITICAL STORE POLICIES:**
+1. **PRICE IS TRUTH:** If price > $0.00, it is not free.
+2. **SCOPE BOUNDARY:** Only discuss products found via tools or context.
+3. **INVENTORY REALITY:** Never guess stock. Use 'lookup_product_info'.
+   - **Math:** (Mfg Lead Time) + (${STANDARD_SHOP_BUILD_DAYS} days Shop Time) = Total Estimate.
 
-**TECHNICAL CHEAT SHEET (World Knowledge Override):**
-- Industry Nine Hydra: 690 POE (0.52°), High buzz, Aluminum spokes available.
-- Onyx Vesper: Instant engagement (Sprag Clutch), Silent, slightly heavier but rolls fast.
-- DT Swiss 350: 36t Ratchet (10°) standard, reliable, easy service.
-- Sapim CX-Ray: Bladed aero, high fatigue life.
-- Sapim Race: Double butted (2.0/1.8/2.0), robust, value.
-- Berd Spokes: Polyethylene (fabric), ultra-light, high damping, requires specific prep.
+**INTELLIGENT SEARCHING (CRITICAL):**
+1. **MAINTAIN CONTEXT:** If the user asks "What do you have in stock?" or "What is faster?", you MUST infer the **Component Type** from the previous conversation.
+   - *Bad:* Searching for "in stock fast".
+   - *Good:* Searching for "Rear Hub" or "DT Swiss Hub" (if the user was just talking about hubs).
+2. **RELEVANCY:** If the user is discussing Hubs, DO NOT recommend Rims or Spokes.
+3. **NO REPETITION:** Do not repeat the full specs/lead times of products you *just* listed in your last message. Summarize or move on to new suggestions.
 
-**CONTEXT:**
-The user's current build configuration (Rims, Hubs, Specs, Prices, Lead Times) is injected into your first message. Use this data to answer specific questions.
+**TECHNICAL CHEAT SHEET:**
+- Hydra2 = Industry Nine Hydra.
+- Onyx Vesper: Instant engagement, Silent.
+- DT Swiss 350: Ratchet, reliable.
+- Sapim CX-Ray: Bladed aero.
 `;
 
 // 2. SHOPIFY TOOL FUNCTION
 async function lookupProductInfo(query: string) {
+  console.log(`[Tool] Searching Shopify for: "${query}"`);
   try {
     const adminResponse = await fetch(`https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-04/graphql.json`, {
         method: 'POST',
@@ -58,13 +54,13 @@ async function lookupProductInfo(query: string) {
         body: JSON.stringify({
             query: `
               query searchProducts($query: String!) {
-                products(first: 3, query: $query) {
+                products(first: 5, query: $query) {
                   edges {
                     node {
                       title
                       totalInventory
                       leadTime: metafield(namespace: "custom", key: "lead_time_days") { value }
-                      variants(first: 3) {
+                      variants(first: 5) {
                         edges {
                           node {
                             title
@@ -90,20 +86,25 @@ async function lookupProductInfo(query: string) {
       const p = e.node;
       const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 0;
       const totalLeadTime = rawLeadTime + STANDARD_SHOP_BUILD_DAYS;
-      const variant = p.variants.edges[0]?.node;
-      const stock = variant ? variant.inventoryQuantity : 0;
-      const policy = variant ? variant.inventoryPolicy : 'deny';
+      
+      // Calculate total stock across variants
+      const totalVariantStock = p.variants.edges.reduce((sum: number, v: any) => sum + v.node.inventoryQuantity, 0);
+      const isContinue = p.variants.edges.some((v: any) => v.node.inventoryPolicy === 'continue');
       
       let status = "In Stock";
-      if (stock <= 0) {
-          status = policy === 'continue' ? `Special Order` : "Sold Out";
+      if (totalVariantStock <= 0) {
+          status = isContinue ? `Special Order` : "Sold Out";
       }
 
-      return `Product: ${p.title}\nStatus: ${status}\nStock: ${stock}\nMfg Lead Time: ${rawLeadTime} days\nCalc Total Lead Time: ~${totalLeadTime} days`;
+      return `Product: ${p.title}
+      Status: ${status}
+      Total Stock: ${totalVariantStock}
+      Mfg Lead Time (metafield: custom.lead_time_days): ${rawLeadTime} days
+      Est. Customer Arrival: ~${totalLeadTime} days from order`;
     });
 
-    if (products.length === 0) return "No products found.";
-    return products.join("\n\n");
+    if (products.length === 0) return "No products found matching that query.";
+    return products.join("\n\n----------------\n\n");
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
@@ -113,7 +114,7 @@ async function lookupProductInfo(query: string) {
 
 // 3. MAIN HANDLER
 export default async function handler(req: any, res: any) {
-  // CORS Headers
+  // CORS
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
@@ -125,7 +126,6 @@ export default async function handler(req: any, res: any) {
   }
 
   try {
-    // Extract isAdmin flag
     const { messages, buildContext, isAdmin } = req.body;
 
     const contextInjection = `
@@ -133,18 +133,15 @@ export default async function handler(req: any, res: any) {
       ${JSON.stringify(buildContext?.components || {})}
     `;
 
-    // DYNAMIC PROMPT MODIFICATION
     let finalSystemPrompt = BASE_SYSTEM_PROMPT + contextInjection;
     
     if (isAdmin) {
         finalSystemPrompt += `
         
-        *** ADMIN MODE ACTIVE ***
-        The user is the STORE OWNER (Admin).
-        1. You may break character if asked.
-        2. If asked "How did you calculate that?", explain the specific math (Mfg Time + Shop Time).
-        3. If asked "Show me the raw data", output the raw text you received from the 'lookup_product_info' tool.
-        4. Be concise and technical.
+        *** ADMIN DEBUG MODE ACTIVE (User is Staff) ***
+        1. If asked about data sources, explicitly state the Metafield Key used (custom.lead_time_days).
+        2. If asked "Why did you say that?", explain your reasoning (e.g. "I saw 0 stock and 10 day lead time in the tool output").
+        3. You may show raw data snippets if requested.
         `;
     }
 
@@ -153,13 +150,12 @@ export default async function handler(req: any, res: any) {
       ...messages.map((m: any) => ({ role: m.role === 'agent' ? 'assistant' : m.role, content: m.content }))
     ];
 
-    // Tool Definition (Same as before)
     const tools = [
       {
         type: "function",
         function: {
           name: "lookup_product_info",
-          description: "Searches store for product inventory/lead time.",
+          description: "Searches the store. IMPORTANT: Include the Component Type in your query (e.g. 'Onyx Hub' or 'Rear Hub') to avoid irrelevant results.",
           parameters: {
             type: "object",
             properties: { query: { type: "string" } },
