@@ -3,7 +3,6 @@ import { openai } from '@ai-sdk/openai';
 import { streamText, tool, convertToCoreMessages } from 'ai';
 import { z } from 'zod';
 
-// Pages Router Config
 export const config = {
   api: {
     bodyParser: true,
@@ -42,7 +41,7 @@ The user's current build configuration (Rims, Hubs, Specs, Prices, Lead Times) i
 `;
 
 export default async function handler(req: any, res: any) {
-  // Manual CORS for Pages Router
+  // Manual CORS
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
@@ -53,11 +52,6 @@ export default async function handler(req: any, res: any) {
 
   if (req.method === 'OPTIONS') {
     res.status(200).end();
-    return;
-  }
-
-  if (req.method !== 'POST') {
-    res.status(405).json({ error: 'Method Not Allowed' });
     return;
   }
 
@@ -79,14 +73,14 @@ export default async function handler(req: any, res: any) {
       model: openai('gpt-4o-mini'),
       system: SYSTEM_PROMPT + contextInjection,
       messages: convertToCoreMessages(messages),
+      maxSteps: 5, // CRITICAL: Allows server to run tools and loop back
       tools: {
         check_live_inventory: tool({
           description: 'Checks the real-time stock quantity of a specific product variant.',
           parameters: z.object({
             variantId: z.string().describe('The Shopify Variant ID (GID or numeric) to check.'),
           }),
-          execute: async (args: any) => {
-            const { variantId } = args;
+          execute: async ({ variantId }) => {
             const numericId = variantId.replace('gid://shopify/ProductVariant/', '');
             try {
               const response = await fetch(
@@ -120,7 +114,7 @@ export default async function handler(req: any, res: any) {
             spokeCount: z.number().describe('Number of spokes (e.g., 28, 32)'),
             crossPattern: z.number().describe('Lacing pattern (e.g., 2 or 3)'),
           }),
-          execute: async (args: any) => {
+          execute: async (args) => {
             try {
               const response = await fetch(process.env.SPOKE_CALC_API_URL || '', {
                 method: 'POST',
@@ -143,6 +137,7 @@ export default async function handler(req: any, res: any) {
       },
     });
 
+    // CRITICAL FIX: Use Text Stream instead of Data Stream for Vanilla JS Compatibility
     result.pipeTextStreamToResponse(res);
 
   } catch (error: any) {
