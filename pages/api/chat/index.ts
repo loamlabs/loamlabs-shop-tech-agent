@@ -11,7 +11,7 @@ export const config = {
 };
 
 const STANDARD_SHOP_BUILD_DAYS = 5;
-const SEARCH_LIMIT = 50;
+const SEARCH_LIMIT = 20; // Reduced from 50 to save overhead
 
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
@@ -21,11 +21,11 @@ You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 - Identity: "LoamLabs Automated Lead Tech".
 
 **CRITICAL SEARCH RULES:**
-1. **SEARCH SIMPLY:** When using the 'lookup_product_info' tool, use ONLY the core Brand or Model name (e.g., "Hydra", "Vesper", "Hydra2"). 
-2. **NO FLUFF:** NEVER include words like "stock", "available", "hub", or "price" in the search query. They break the search engine.
-3. **INVENTORY PRECISION:** Parse the tool output carefully. If it lists specific variants in stock, report them.
-4. **LEAD TIME MATH:** In Stock = ~${STANDARD_SHOP_BUILD_DAYS} days. Out of Stock = Mfg Lead Time + ${STANDARD_SHOP_BUILD_DAYS} days.
-5. **ALWAYS REPLY:** Even if the tool returns "No products found", you MUST tell the user "I couldn't find anything matching [Term]. Did you mean...?"
+1. **SEARCH SIMPLY:** Use ONLY the core Brand or Model name.
+2. **NO FLUFF:** NEVER include words like "stock", "available", "hub".
+3. **MANDATORY RESPONSE:** After the tool returns a list of products, you **MUST** write a response summarizing what was found. Do not stay silent.
+4. **INVENTORY PRECISION:** If the tool lists specific variants in stock, report them explicitly.
+5. **LEAD TIME MATH:** In Stock = ~${STANDARD_SHOP_BUILD_DAYS} days. Out of Stock = Mfg Lead Time + ${STANDARD_SHOP_BUILD_DAYS} days.
 
 **CONTEXT:**
 The user's current selections are injected. If they ask about something NOT selected, use the 'lookup_product_info' tool.
@@ -70,7 +70,6 @@ async function lookupProductInfo(query: string) {
 
     const data = await adminResponse.json();
     
-    // Debug Log for Shopify Response
     if (!data.data || !data.data.products) {
         console.error("[Shopify Error] Invalid Data:", JSON.stringify(data));
         return "Search failed. The store database returned an error.";
@@ -96,7 +95,12 @@ async function lookupProductInfo(query: string) {
     });
 
     if (products.length === 0) return "No products found matching that query. Try a simpler search term.";
-    return products.join("\n");
+    
+    // LIMIT RESULTS TO TOP 5 TO PREVENT CONTEXT OVERLOAD
+    const limitedProducts = products.slice(0, 5);
+    console.log(`[Tool] Returning top ${limitedProducts.length} results to AI.`);
+    
+    return limitedProducts.join("\n") + (count > 5 ? `\n...(and ${count - 5} more items)` : "");
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
@@ -138,20 +142,14 @@ export default async function handler(req: any, res: any) {
             console.log("[Tool Debug] Raw Args:", JSON.stringify(args));
             
             let q = args.query;
-            
-            // Intelligent Argument Reconstruction
             if (!q || typeof q !== 'string') {
                 q = Object.values(args)
                     .filter(v => v && typeof v === 'string' && v.trim().length > 0)
                     .join(" ");
             }
-            
-            // CLEANUP: Remove common "fluff" words that break Shopify search
             if (q) {
-                // Remove "stock", "available", "hub", "hubs", "in" (case insensitive)
                 q = q.replace(/\b(stock|available|hub|hubs|pair|set|in)\b/gi, '').trim();
             }
-            
             if (!q) q = "undefined";
             
             return await lookupProductInfo(String(q));
@@ -192,6 +190,9 @@ export default async function handler(req: any, res: any) {
     let hasSentText = false;
 
     for await (const part of result.fullStream) {
+        // Debug Log: Check what parts are being emitted (tool-call, tool-result, text-delta)
+        console.log("Stream Part Type:", part.type); 
+
         const textContent = part.textDelta || part.text || part.content || "";
         if (part.type === 'text-delta' && typeof textContent === 'string' && textContent.length > 0) {
             res.write(textContent);
