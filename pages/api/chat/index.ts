@@ -7,11 +7,11 @@ export const config = {
   api: {
     bodyParser: true,
   },
+  runtime: 'nodejs',
 };
 
-// --- LOGIC SETTINGS ---
 const STANDARD_SHOP_BUILD_DAYS = 5;
-const SEARCH_LIMIT = 50; // Increased to see more products
+const SEARCH_LIMIT = 50;
 
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
@@ -20,26 +20,15 @@ You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 - Professional, technical, direct, and "down to earth."
 - Identity: "LoamLabs Automated Lead Tech".
 
-**CRITICAL SEARCH RULES (ANTI-TUNNEL VISION):**
-1. **BROADEN THE SCOPE:** If a user asks "What else do you have?" or "Any other options?", you MUST perform a NEW search.
-   - **DO NOT** assume they still want the previous brand (e.g. Industry Nine).
-   - **DO** search for the **Component Type + Spec**.
-   - *Example:* If discussing "Hydra 12x148" and user asks for options, search for "Rear Hub 12x148" to find DT Swiss, Onyx, etc.
-
-2. **INVENTORY PRECISION:** 
-   - The tool returns a list of variants.
-   - You must parse this list. If the tool lists "DT Swiss 350 12x148: In Stock", report it!
-   - Do not say "Everything is out of stock" unless the tool explicitly says 0 qty for ALL returned items.
-
-3. **LEAD TIME MATH:**
-   - **In Stock:** ~${STANDARD_SHOP_BUILD_DAYS} business days to build.
-   - **Out of Stock:** (Mfg Lead Time from Tool) + (${STANDARD_SHOP_BUILD_DAYS} days Shop Time).
+**CRITICAL SEARCH RULES:**
+1. **BROADEN THE SCOPE:** If a user asks "What else do you have?", search for **Component Type + Spec** (e.g. "Rear Hub 12x148"). DO NOT assume the previous brand.
+2. **INVENTORY PRECISION:** Parse the tool output carefully. If it lists specific variants in stock, report them.
+3. **LEAD TIME MATH:** In Stock = ~${STANDARD_SHOP_BUILD_DAYS} days. Out of Stock = Mfg Lead Time + ${STANDARD_SHOP_BUILD_DAYS} days.
 
 **CONTEXT:**
 The user's current selections are injected. If they ask about something NOT selected, use the 'lookup_product_info' tool.
 `;
 
-// 2. SHOPIFY TOOL FUNCTION
 async function lookupProductInfo(query: string) {
   console.log(`[Tool] Searching Shopify for: "${query}"`);
   try {
@@ -84,14 +73,11 @@ async function lookupProductInfo(query: string) {
       const p = e.node;
       const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 0;
       
-      // Analyze Variants for specific specs
       const inStockVariants: string[] = [];
       
       p.variants.edges.forEach((v: any) => {
           const node = v.node;
-          // Create a readable spec string (e.g. "Black / 32h / 12x148")
           const name = node.title.replace('Default Title', 'Standard');
-          
           if (node.inventoryQuantity > 0) {
               inStockVariants.push(`${name} (Qty: ${node.inventoryQuantity})`);
           }
@@ -102,7 +88,6 @@ async function lookupProductInfo(query: string) {
           stockSummary = `> IN STOCK: ${inStockVariants.join(', ')}`;
       }
 
-      // Compact Output format to save token space
       return `ITEM: ${p.title} | ${stockSummary} | Mfg Lead Time: ${rawLeadTime} days`;
     });
 
@@ -115,9 +100,8 @@ async function lookupProductInfo(query: string) {
   }
 }
 
-// 3. MAIN HANDLER
 export default async function handler(req: any, res: any) {
-  // CORS Headers
+  // CORS
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
@@ -130,18 +114,11 @@ export default async function handler(req: any, res: any) {
 
   try {
     const { messages, buildContext, isAdmin } = req.body;
-
-    const contextInjection = `
-      [CURRENT USER SELECTIONS]:
-      ${JSON.stringify(buildContext?.components || {})}
-    `;
-
-    let finalSystemPrompt = SYSTEM_PROMPT + contextInjection;
+    let finalSystemPrompt = SYSTEM_PROMPT + `\n[CONTEXT]: ${JSON.stringify(buildContext?.components || {})}`;
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
-    // GOOGLE GEMINI CONFIGURATION
     const result = await streamText({
-      model: google('gemini-1.5-flash'),
+      model: google('models/gemini-pro'), // FALLBACK TO STABLE MODEL
       system: finalSystemPrompt,
       messages: convertToCoreMessages(messages),
       maxSteps: 5,
@@ -176,15 +153,18 @@ export default async function handler(req: any, res: any) {
       },
     });
 
-    // Manual Streaming Loop
+    // Manual Stream Loop (Adapted for Google Provider structure)
     res.writeHead(200, {
       'Content-Type': 'text/plain; charset=utf-8',
       'Transfer-Encoding': 'chunked',
       'Connection': 'keep-alive'
     });
 
-    for await (const textPart of result.textStream) {
-      res.write(textPart);
+    // Google provider streams text deltas differently, this captures them
+    for await (const part of result.fullStream) {
+        if (part.type === 'text-delta') {
+            res.write(part.textDelta);
+        }
     }
 
     res.end();
