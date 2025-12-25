@@ -53,7 +53,7 @@ export async function POST(req: Request) {
     `;
 
     const result = await streamText({
-      model: google('gemini-1.5-flash'), // Removed 'models/' prefix and version suffix
+      model: google('models/gemini-pro'),
       system: SYSTEM_PROMPT + contextInjection,
       messages: convertToCoreMessages(messages),
       tools: {
