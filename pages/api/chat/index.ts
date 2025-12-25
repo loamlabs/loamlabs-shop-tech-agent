@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { google } from '@ai-sdk/google';
-import { streamText, tool } from 'ai'; // Removed convertToCoreMessages to fix import error
+import { streamText, tool } from 'ai'; 
 import { z } from 'zod';
 
 // Ensure we are using Node runtime for manual response piping
@@ -119,9 +119,9 @@ export default async function handler(req: any, res: any) {
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
     const result = await streamText({
-      model: google('gemini-1.5-flash'),
+      // FIXED: Using explicit version suffix '-001' to resolve 404 error
+      model: google('gemini-1.5-flash-001'),
       system: finalSystemPrompt,
-      // FIXED: Manual message mapping removes dependency on 'convertToCoreMessages'
       messages: messages.map((m: any) => ({
         role: m.role,
         content: m.content
