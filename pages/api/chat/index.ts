@@ -143,7 +143,7 @@ export default async function handler(req: any, res: any) {
       },
     });
 
-    result.pipeDataStreamToResponse(res);
+    result.pipeTextStreamToResponse(res);
 
   } catch (error: any) {
     console.error("AI ROUTE ERROR:", error);
