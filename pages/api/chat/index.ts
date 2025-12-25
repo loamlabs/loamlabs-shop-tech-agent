@@ -45,7 +45,6 @@ You are speaking to a customer in the Custom Wheel Builder.
 **CONTEXT:**
 The user's current build configuration (Rims, Hubs, Specs, Prices, Lead Times) is injected into your first message. Use this data to answer specific questions.
 `;
-`;
 
 // 2. SHOPIFY TOOL FUNCTION (Server-Side)
 async function lookupProductInfo(query: string) {
