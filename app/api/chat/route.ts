@@ -53,9 +53,9 @@ export async function POST(req: Request) {
     `;
 
     const result = await streamText({
-      model: google('models/gemini-1.5-flash-001'),
+      model: google('gemini-1.5-flash'), // Removed 'models/' prefix and version suffix
       system: SYSTEM_PROMPT + contextInjection,
-      messages: convertToCoreMessages(messages), // Fixes the "Invalid Prompt" error
+      messages: convertToCoreMessages(messages),
       tools: {
         check_live_inventory: tool({
           description: 'Checks the real-time stock quantity of a specific product variant.',
@@ -120,7 +120,7 @@ export async function POST(req: Request) {
       },
     });
 
-    return result.toTextStreamResponse(); // The correct method for SDK v3.4
+    return result.toTextStreamResponse();
 
   } catch (error: any) {
     console.error("AI ROUTE ERROR:", error);
