@@ -1,5 +1,6 @@
 // @ts-nocheck
-import OpenAI from 'openai';
+import { google } from '@ai-sdk/google';
+import { streamText, tool, convertToCoreMessages } from 'ai';
 import { z } from 'zod';
 
 export const config = {
@@ -8,11 +9,9 @@ export const config = {
   },
 };
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
+// --- LOGIC SETTINGS ---
 const STANDARD_SHOP_BUILD_DAYS = 5;
+const SEARCH_LIMIT = 50; // Increased to see more products
 
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
@@ -21,26 +20,26 @@ You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 - Professional, technical, direct, and "down to earth."
 - Identity: "LoamLabs Automated Lead Tech".
 
-**CRITICAL BEHAVIOR RULES:**
-1. **PROACTIVITY:** If a user asks "What else do you have?", **DO NOT GUESS.**
-   - First, check if you know their **Axle Spacing** (e.g. 15x110) and **Brake Style** (e.g. 6-Bolt).
-   - If you don't know, **ASK THEM FIRST**. (e.g., "To check stock accurately, do you need Boost (15x110) or Standard (12x100) spacing?").
-   - Only run the search *after* you know what fits their bike.
+**CRITICAL SEARCH RULES (ANTI-TUNNEL VISION):**
+1. **BROADEN THE SCOPE:** If a user asks "What else do you have?" or "Any other options?", you MUST perform a NEW search.
+   - **DO NOT** assume they still want the previous brand (e.g. Industry Nine).
+   - **DO** search for the **Component Type + Spec**.
+   - *Example:* If discussing "Hydra 12x148" and user asks for options, search for "Rear Hub 12x148" to find DT Swiss, Onyx, etc.
 
 2. **INVENTORY PRECISION:** 
-   - The search tool returns a list of *specific variants* that are in stock.
-   - Do NOT say "DT Swiss 180 is out of stock" just because *some* are out.
-   - Look closely at the tool output. If it says "IN STOCK VARIANTS: 12x100", tell the user: "I have the 12x100 version in stock, but the 15x110 is special order."
+   - The tool returns a list of variants.
+   - You must parse this list. If the tool lists "DT Swiss 350 12x148: In Stock", report it!
+   - Do not say "Everything is out of stock" unless the tool explicitly says 0 qty for ALL returned items.
 
 3. **LEAD TIME MATH:**
-   - **In Stock Items:** ~${STANDARD_SHOP_BUILD_DAYS} business days to build.
+   - **In Stock:** ~${STANDARD_SHOP_BUILD_DAYS} business days to build.
    - **Out of Stock:** (Mfg Lead Time from Tool) + (${STANDARD_SHOP_BUILD_DAYS} days Shop Time).
 
-**SEARCHING:** 
-- If specific search fails (e.g. "Hydra2"), try broad terms like "Industry Nine" or "DT Swiss".
+**CONTEXT:**
+The user's current selections are injected. If they ask about something NOT selected, use the 'lookup_product_info' tool.
 `;
 
-// 2. SHOPIFY TOOL FUNCTION (Advanced Variant Analysis)
+// 2. SHOPIFY TOOL FUNCTION
 async function lookupProductInfo(query: string) {
   console.log(`[Tool] Searching Shopify for: "${query}"`);
   try {
@@ -53,7 +52,7 @@ async function lookupProductInfo(query: string) {
         body: JSON.stringify({
             query: `
               query searchProducts($query: String!) {
-                products(first: 15, query: $query) {
+                products(first: ${SEARCH_LIMIT}, query: $query) {
                   edges {
                     node {
                       title
@@ -65,7 +64,6 @@ async function lookupProductInfo(query: string) {
                             title
                             inventoryPolicy
                             inventoryQuantity
-                            price
                             selectedOptions { name value }
                           }
                         }
@@ -86,36 +84,30 @@ async function lookupProductInfo(query: string) {
       const p = e.node;
       const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 0;
       
-      // Analyze Variants
+      // Analyze Variants for specific specs
       const inStockVariants: string[] = [];
-      const outOfStockVariants: string[] = [];
       
       p.variants.edges.forEach((v: any) => {
           const node = v.node;
-          // Get useful specs from title or options
+          // Create a readable spec string (e.g. "Black / 32h / 12x148")
           const name = node.title.replace('Default Title', 'Standard');
           
           if (node.inventoryQuantity > 0) {
               inStockVariants.push(`${name} (Qty: ${node.inventoryQuantity})`);
-          } else if (node.inventoryPolicy === 'continue') {
-              outOfStockVariants.push(name);
           }
       });
 
-      let stockSummary = "";
+      let stockSummary = "Status: Special Order Only (Out of Stock)";
       if (inStockVariants.length > 0) {
-          stockSummary = `> IN STOCK VARIANTS: ${inStockVariants.join(', ')}`;
-      } else {
-          stockSummary = "> ALL VARIANTS OUT OF STOCK (Special Order Only)";
+          stockSummary = `> IN STOCK: ${inStockVariants.join(', ')}`;
       }
 
-      return `PRODUCT: ${p.title}
-      Mfg Lead Time: ${rawLeadTime} days
-      ${stockSummary}`;
+      // Compact Output format to save token space
+      return `ITEM: ${p.title} | ${stockSummary} | Mfg Lead Time: ${rawLeadTime} days`;
     });
 
     if (products.length === 0) return "No products found matching that query.";
-    return products.join("\n\n");
+    return products.join("\n");
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
@@ -145,119 +137,60 @@ export default async function handler(req: any, res: any) {
     `;
 
     let finalSystemPrompt = SYSTEM_PROMPT + contextInjection;
+    if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
-    if (isAdmin) {
-        finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
-    }
-
-    const openAiMessages = [
-      { role: 'system', content: finalSystemPrompt },
-      ...messages.map((m: any) => ({ 
-        role: m.role === 'agent' ? 'assistant' : m.role, 
-        content: m.content 
-      }))
-    ];
-
-    const tools = [
-      {
-        type: "function",
-        function: {
-          name: "lookup_product_info",
-          description: "Searches the store. Query should be the Product Name or Category (e.g. 'DT Swiss Hubs', 'Rear Hub').",
-          parameters: {
-            type: "object",
-            properties: { query: { type: "string" } },
-            required: ["query"],
+    // GOOGLE GEMINI CONFIGURATION
+    const result = await streamText({
+      model: google('gemini-1.5-flash'),
+      system: finalSystemPrompt,
+      messages: convertToCoreMessages(messages),
+      maxSteps: 5,
+      tools: {
+        lookup_product_info: tool({
+          description: 'Searches the store. Query should be the Product Name or Spec (e.g. "Rear Hub 12x148").',
+          parameters: z.object({ query: z.string() }),
+          execute: async ({ query }) => await lookupProductInfo(query),
+        }),
+        calculate_spoke_lengths: tool({
+          description: 'Calculates precise spoke lengths.',
+          parameters: z.object({
+            erd: z.number(), pcdLeft: z.number(), pcdRight: z.number(),
+            flangeLeft: z.number(), flangeRight: z.number(),
+            spokeCount: z.number(), crossPattern: z.number()
+          }),
+          execute: async (args) => {
+            try {
+              const r = await fetch(process.env.SPOKE_CALC_API_URL || '', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'x-internal-secret': process.env.SPOKE_CALC_API_SECRET || '',
+                },
+                body: JSON.stringify(args),
+              });
+              const d = await r.json();
+              return `Calculated: Left ${d.left}mm, Right ${d.right}mm`;
+            } catch (e) { return "Calc Error"; }
           },
-        },
+        }),
       },
-      {
-        type: "function",
-        function: {
-          name: "calculate_spoke_lengths",
-          description: "Calculates precise spoke lengths.",
-          parameters: {
-            type: "object",
-            properties: {
-              erd: { type: "number" },
-              pcdLeft: { type: "number" },
-              pcdRight: { type: "number" },
-              flangeLeft: { type: "number" },
-              flangeRight: { type: "number" },
-              spokeCount: { type: "number" },
-              crossPattern: { type: "number" },
-            },
-            required: ["erd", "pcdLeft", "pcdRight", "flangeLeft", "flangeRight", "spokeCount", "crossPattern"]
-          }
-        }
-      }
-    ];
-
-    const firstResponse = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: openAiMessages,
-      tools: tools,
-      tool_choice: "auto",
     });
 
-    const responseMessage = firstResponse.choices[0].message;
-    const toolCalls = responseMessage.tool_calls;
-
-    if (toolCalls) {
-      openAiMessages.push(responseMessage);
-
-      for (const toolCall of toolCalls) {
-        const fnName = toolCall.function.name;
-        const args = JSON.parse(toolCall.function.arguments);
-        let functionResponse = "Error";
-
-        if (fnName === "lookup_product_info") {
-          functionResponse = await lookupProductInfo(args.query);
-        } else if (fnName === "calculate_spoke_lengths") {
-           try {
-            const apiRes = await fetch(process.env.SPOKE_CALC_API_URL || '', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'x-internal-secret': process.env.SPOKE_CALC_API_SECRET || '',
-              },
-              body: JSON.stringify(args),
-            });
-            const calcData = await apiRes.json();
-            functionResponse = `Calculated: Left ${calcData.left}mm, Right ${calcData.right}mm`;
-           } catch(e) { functionResponse = "Calc Error"; }
-        }
-
-        openAiMessages.push({
-          tool_call_id: toolCall.id,
-          role: "tool",
-          name: fnName,
-          content: functionResponse,
-        });
-      }
-    }
-
+    // Manual Streaming Loop
     res.writeHead(200, {
       'Content-Type': 'text/plain; charset=utf-8',
       'Transfer-Encoding': 'chunked',
       'Connection': 'keep-alive'
     });
 
-    const stream = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: openAiMessages,
-      stream: true,
-    });
-
-    for await (const chunk of stream) {
-      const content = chunk.choices[0]?.delta?.content || '';
-      if (content) res.write(content);
+    for await (const textPart of result.textStream) {
+      res.write(textPart);
     }
 
     res.end();
 
   } catch (error: any) {
     console.error("AI ROUTE ERROR:", error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message || JSON.stringify(error) });
   }
 }
