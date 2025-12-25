@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { google } from '@ai-sdk/google';
+import { openai } from '@ai-sdk/openai';
 import { streamText, tool, convertToCoreMessages } from 'ai';
 import { z } from 'zod';
 
@@ -53,7 +53,7 @@ export async function POST(req: Request) {
     `;
 
     const result = await streamText({
-      model: google('models/gemini-1.0-pro'),
+      model: openai('gpt-4o-mini'),
       system: SYSTEM_PROMPT + contextInjection,
       messages: convertToCoreMessages(messages),
       tools: {
