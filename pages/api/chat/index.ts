@@ -1,7 +1,7 @@
 // @ts-nocheck
 import OpenAI from 'openai';
-import { z } from 'zod';
 
+// 1. CONFIGURATION
 export const config = {
   api: {
     bodyParser: true,
@@ -11,6 +11,8 @@ export const config = {
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
+
+const STANDARD_SHOP_BUILD_DAYS = 5; // LoamLabs internal build buffer
 
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
@@ -27,9 +29,11 @@ You are speaking to a customer in the Custom Wheel Builder.
 1. **PRICE IS TRUTH:** You have access to the live build state. If a component (like a Valve Stem) has a price > $0.00 in the system, it is NOT free. Never tell a customer an item is included unless the price is explicitly $0.00.
 2. **NO ASSUMPTIONS:** Do not assume manufacturer policies (like "Reserve includes valves") apply here. LoamLabs custom builds are a la carte.
 3. **SCOPE BOUNDARY:** Only discuss products currently available in the builder context provided to you. If a user asks about a brand we don't carry (e.g., "Zipp"), say: "We don't stock those currently. I recommend Reserve or other relevant brands we carry for similar performance."
-4. **INVENTORY REALITY:** Do not guess stock. If asked "Is this in stock?", use the 'check_live_inventory' tool. 
-   - If an item is NOT in stock (quantity <= 0), check the provided 'leadTimeDays' data in the context.
-   - You can give a rough estimate based on that lead time, but **always** add the caveat: *"This assumes the manufacturer currently has it in stock, which we would need to verify."*
+4. **INVENTORY REALITY:** Do not guess stock. If asked "Is this in stock?" or "What is the lead time?", you MUST use the 'lookup_product_info' tool if the item is not currently selected in the context.
+   - Manufacturer Lead Times are stored in the product data (e.g., '10').
+   - LoamLabs Build Time is ${STANDARD_SHOP_BUILD_DAYS} days.
+   - **Total Lead Time = Manufacturer Time + Build Time.**
+   - ALWAYS calculate this for the customer. Example: "The hub has a 10-day lead time, plus our 5-day build time, so expect about 2-3 weeks."
 
 **TECHNICAL CHEAT SHEET (World Knowledge Override):**
 - Industry Nine Hydra: 690 POE (0.52°), High buzz, Aluminum spokes available.
@@ -43,15 +47,87 @@ You are speaking to a customer in the Custom Wheel Builder.
 The user's current build configuration (Rims, Hubs, Specs, Prices, Lead Times) is injected into your first message. Use this data to answer specific questions.
 `;
 
+// 2. SHOPIFY TOOL FUNCTION (Server-Side)
+async function lookupProductInfo(query: string) {
+  try {
+    const adminResponse = await fetch(`https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-04/graphql.json`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN || ''
+        },
+        body: JSON.stringify({
+            query: `
+              query searchProducts($query: String!) {
+                products(first: 3, query: $query) {
+                  edges {
+                    node {
+                      title
+                      totalInventory
+                      leadTime: metafield(namespace: "custom", key: "lead_time_days") { value }
+                      variants(first: 3) {
+                        edges {
+                          node {
+                            title
+                            inventoryPolicy
+                            inventoryQuantity
+                            price
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `,
+            variables: { query }
+        })
+    });
+
+    const data = await adminResponse.json();
+    
+    if (!data.data || !data.data.products) {
+        return "Search failed or returned no data.";
+    }
+
+    const products = data.data.products.edges.map((e: any) => {
+      const p = e.node;
+      // Get Lead Time (Default to 0 if missing)
+      const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 0;
+      const totalLeadTime = rawLeadTime + STANDARD_SHOP_BUILD_DAYS;
+      
+      const variant = p.variants.edges[0]?.node;
+      const stock = variant ? variant.inventoryQuantity : 0;
+      const policy = variant ? variant.inventoryPolicy : 'deny';
+      
+      let status = "In Stock";
+      if (stock <= 0) {
+          status = policy === 'continue' 
+            ? `Special Order (Mfg Lead Time: ${rawLeadTime} days + ${STANDARD_SHOP_BUILD_DAYS} days build = ~${totalLeadTime} days total)` 
+            : "Sold Out";
+      } else {
+          status = `In Stock (Ships in ~${STANDARD_SHOP_BUILD_DAYS} days)`;
+      }
+
+      return `Product: ${p.title}\nStatus: ${status}\nStock Level: ${stock}\nMetadata Lead Time: ${rawLeadTime} days`;
+    });
+
+    if (products.length === 0) return "No products found matching that name.";
+    return products.join("\n\n");
+
+  } catch (error) {
+    console.error("Shopify Lookup Error:", error);
+    return "Error connecting to product database.";
+  }
+}
+
+// 3. MAIN HANDLER
 export default async function handler(req: any, res: any) {
-  // CORS Headers
+  // CORS
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
-  );
+  res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
 
   if (req.method === 'OPTIONS') {
     res.status(200).end();
@@ -62,46 +138,11 @@ export default async function handler(req: any, res: any) {
     const { messages, buildContext } = req.body;
 
     const contextInjection = `
-      [CURRENT BUILD STATE]:
-      - Step: ${buildContext?.step || 'Unknown'}
-      - Riding Style: ${buildContext?.ridingStyle || 'Not Selected'}
-      - Specs: ${JSON.stringify(buildContext?.specs || {})}
-      - Selected Components: ${JSON.stringify(buildContext?.components || {})}
-      - Estimated Weight: ${buildContext?.calculatedWeight || 'Unknown'}g
-      - Subtotal: $${(buildContext?.subtotal / 100).toFixed(2) || '0.00'}
-      - Estimated Shop Lead Time: ${buildContext?.leadTime || 'Standard'} Days
+      [CURRENT USER SELECTIONS]:
+      ${JSON.stringify(buildContext?.components || {})}
     `;
 
-    // Add System Prompt to message history
+    // 1. Prepare Messages
     const openAiMessages = [
       { role: 'system', content: SYSTEM_PROMPT + contextInjection },
-      ...messages.map((m: any) => ({ role: m.role === 'agent' ? 'assistant' : m.role, content: m.content }))
-    ];
-
-    // Set up Streaming Response
-    res.writeHead(200, {
-      'Content-Type': 'text/plain; charset=utf-8',
-      'Transfer-Encoding': 'chunked',
-      'Connection': 'keep-alive'
-    });
-
-    const stream = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: openAiMessages,
-      stream: true,
-    });
-
-    for await (const chunk of stream) {
-      const content = chunk.choices[0]?.delta?.content || '';
-      if (content) {
-        res.write(content);
-      }
-    }
-
-    res.end();
-
-  } catch (error: any) {
-    console.error("AI ROUTE ERROR:", error);
-    res.status(500).json({ error: error.message });
-  }
-}
+      ...messages.map((m: any) => ({ role: m.role === 'agent' ? 'assistant'
