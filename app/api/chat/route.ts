@@ -38,88 +38,98 @@ The user's current build configuration (Rims, Hubs, Specs, Prices, Lead Times) i
 `;
 
 export async function POST(req: Request) {
-  const { messages, buildContext } = await req.json();
+  try {
+    const { messages, buildContext } = await req.json();
 
-  const contextInjection = `
-    [CURRENT BUILD STATE]:
-    - Step: ${buildContext?.step || 'Unknown'}
-    - Riding Style: ${buildContext?.ridingStyle || 'Not Selected'}
-    - Specs: ${JSON.stringify(buildContext?.specs || {})}
-    - Selected Components: ${JSON.stringify(buildContext?.components || {})}
-    - Estimated Weight: ${buildContext?.calculatedWeight || 'Unknown'}g
-    - Subtotal: $${(buildContext?.subtotal / 100).toFixed(2) || '0.00'}
-    - Estimated Shop Lead Time: ${buildContext?.leadTime || 'Standard'} Days
-  `;
+    console.log("Incoming Request Context:", buildContext ? "Present" : "Missing");
 
-  const result = streamText({
-    model: google('models/gemini-1.5-flash'),
-    system: SYSTEM_PROMPT + contextInjection,
-    messages: messages,
-    tools: {
-      check_live_inventory: tool({
-        description: 'Checks the real-time stock quantity of a specific product variant.',
-        parameters: z.object({
-          variantId: z.string().describe('The Shopify Variant ID (GID or numeric) to check.'),
+    const contextInjection = `
+      [CURRENT BUILD STATE]:
+      - Step: ${buildContext?.step || 'Unknown'}
+      - Riding Style: ${buildContext?.ridingStyle || 'Not Selected'}
+      - Specs: ${JSON.stringify(buildContext?.specs || {})}
+      - Selected Components: ${JSON.stringify(buildContext?.components || {})}
+      - Estimated Weight: ${buildContext?.calculatedWeight || 'Unknown'}g
+      - Subtotal: $${(buildContext?.subtotal / 100).toFixed(2) || '0.00'}
+      - Estimated Shop Lead Time: ${buildContext?.leadTime || 'Standard'} Days
+    `;
+
+    const result = streamText({
+      model: google('models/gemini-1.5-flash'),
+      system: SYSTEM_PROMPT + contextInjection,
+      messages: messages,
+      tools: {
+        check_live_inventory: tool({
+          description: 'Checks the real-time stock quantity of a specific product variant.',
+          parameters: z.object({
+            variantId: z.string().describe('The Shopify Variant ID (GID or numeric) to check.'),
+          }),
+          execute: async (args: any) => {
+            const { variantId } = args;
+            const numericId = variantId.replace('gid://shopify/ProductVariant/', '');
+            try {
+              const response = await fetch(
+                `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-04/variants/${numericId}.json`,
+                {
+                  headers: {
+                    'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN || '',
+                  },
+                }
+              );
+              const data = await response.json();
+              const q = data.variant.inventory_quantity;
+              const policy = data.variant.inventory_policy;
+              
+              if (q > 0) return `In Stock: We have ${q} units available right now.`;
+              if (q <= 0 && policy === 'continue') return `Special Order: Currently out of stock, but available for order.`;
+              return `Sold Out: Currently unavailable.`;
+            } catch (error) {
+              return 'I could not verify the live inventory right now.';
+            }
+          },
         }),
-        // Using 'any' to bypass strict TS build errors on Vercel
-        execute: async (args: any) => {
-          const { variantId } = args;
-          const numericId = variantId.replace('gid://shopify/ProductVariant/', '');
-          try {
-            const response = await fetch(
-              `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-04/variants/${numericId}.json`,
-              {
+        calculate_spoke_lengths: tool({
+          description: 'Calculates precise spoke lengths for a rim/hub combination using the internal engineering engine.',
+          parameters: z.object({
+            erd: z.number().describe('Effective Rim Diameter in mm'),
+            pcdLeft: z.number().describe('Hub Pitch Circle Diameter Left'),
+            pcdRight: z.number().describe('Hub Pitch Circle Diameter Right'),
+            flangeLeft: z.number().describe('Hub Flange Offset Left'),
+            flangeRight: z.number().describe('Hub Flange Offset Right'),
+            spokeCount: z.number().describe('Number of spokes (e.g., 28, 32)'),
+            crossPattern: z.number().describe('Lacing pattern (e.g., 2 or 3)'),
+          }),
+          execute: async (args: any) => {
+            try {
+              const response = await fetch(process.env.SPOKE_CALC_API_URL || '', {
+                method: 'POST',
                 headers: {
-                  'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN || '',
+                  'Content-Type': 'application/json',
+                  'x-internal-secret': process.env.SPOKE_CALC_API_SECRET || '',
                 },
-              }
-            );
-            const data = await response.json();
-            const q = data.variant.inventory_quantity;
-            const policy = data.variant.inventory_policy;
-            
-            if (q > 0) return `In Stock: We have ${q} units available right now.`;
-            if (q <= 0 && policy === 'continue') return `Special Order: Currently out of stock, but available for order.`;
-            return `Sold Out: Currently unavailable.`;
-          } catch (error) {
-            return 'I could not verify the live inventory right now.';
-          }
-        },
-      }),
-      calculate_spoke_lengths: tool({
-        description: 'Calculates precise spoke lengths for a rim/hub combination using the internal engineering engine.',
-        parameters: z.object({
-          erd: z.number().describe('Effective Rim Diameter in mm'),
-          pcdLeft: z.number().describe('Hub Pitch Circle Diameter Left'),
-          pcdRight: z.number().describe('Hub Pitch Circle Diameter Right'),
-          flangeLeft: z.number().describe('Hub Flange Offset Left'),
-          flangeRight: z.number().describe('Hub Flange Offset Right'),
-          spokeCount: z.number().describe('Number of spokes (e.g., 28, 32)'),
-          crossPattern: z.number().describe('Lacing pattern (e.g., 2 or 3)'),
+                body: JSON.stringify(args),
+              });
+              
+              if (!response.ok) throw new Error('Calculation service failed');
+              
+              const result = await response.json();
+              return `Calculated Lengths: Left ${result.left}mm, Right ${result.right}mm. (Note: We handle final rounding during the build).`;
+            } catch (error) {
+              return 'I tried to run the math, but there is an issue on our end I need to look into. I can estimate based on similar builds if you want.';
+            }
+          },
         }),
-        // Using 'any' to bypass strict TS build errors on Vercel
-        execute: async (args: any) => {
-          try {
-            const response = await fetch(process.env.SPOKE_CALC_API_URL || '', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'x-internal-secret': process.env.SPOKE_CALC_API_SECRET || '',
-              },
-              body: JSON.stringify(args),
-            });
-            
-            if (!response.ok) throw new Error('Calculation service failed');
-            
-            const result = await response.json();
-            return `Calculated Lengths: Left ${result.left}mm, Right ${result.right}mm. (Note: We handle final rounding during the build).`;
-          } catch (error) {
-            return 'I tried to run the math, but there is an issue on our end I need to look into. I can estimate based on similar builds if you want.';
-          }
-        },
-      }),
-    },
-  });
+      },
+    });
 
-  return result.toDataStreamResponse();
+    return result.toDataStreamResponse();
+
+  } catch (error: any) {
+    console.error("AI ROUTE ERROR:", error);
+    // Return the actual error message to the frontend so we can debug
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
 }
