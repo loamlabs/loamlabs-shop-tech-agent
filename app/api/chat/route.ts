@@ -2,7 +2,7 @@ import { google } from '@ai-sdk/google';
 import { convertToCoreMessages, streamText, tool } from 'ai';
 import { z } from 'zod';
 
-// --- JERRY'S PERSONA & STORE POLICY ---
+// --- PERSONA & STORE POLICY ---
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 You are speaking to a customer in the Custom Wheel Builder.
