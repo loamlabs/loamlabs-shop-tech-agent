@@ -122,7 +122,7 @@ export async function POST(req: Request) {
       },
     });
 
-    return result.toDataStreamResponse();
+    return result.toAIStreamResponse();
 
   } catch (error: any) {
     console.error("AI ROUTE ERROR:", error);
