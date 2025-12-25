@@ -3,10 +3,13 @@ import { openai } from '@ai-sdk/openai';
 import { streamText, tool, convertToCoreMessages } from 'ai';
 import { z } from 'zod';
 
-export const maxDuration = 60;
-export const dynamic = 'force-dynamic'; // Force dynamic handling
+// Pages Router Config
+export const config = {
+  api: {
+    bodyParser: true,
+  },
+};
 
-// --- PERSONA & STORE POLICY ---
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 You are speaking to a customer in the Custom Wheel Builder.
@@ -38,18 +41,28 @@ You are speaking to a customer in the Custom Wheel Builder.
 The user's current build configuration (Rims, Hubs, Specs, Prices, Lead Times) is injected into your first message. Use this data to answer specific questions.
 `;
 
-// Helper for GET requests (Health Check)
-export async function GET() {
-  return new Response(JSON.stringify({ status: "Online", provider: "OpenAI" }), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
-}
+export default async function handler(req: any, res: any) {
+  // Manual CORS for Pages Router
+  res.setHeader('Access-Control-Allow-Credentials', true);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
+  );
 
-// Main POST Handler
-export async function POST(req: Request) {
+  if (req.method === 'OPTIONS') {
+    res.status(200).end();
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'Method Not Allowed' });
+    return;
+  }
+
   try {
-    const { messages, buildContext } = await req.json();
+    const { messages, buildContext } = req.body;
 
     const contextInjection = `
       [CURRENT BUILD STATE]:
@@ -130,13 +143,10 @@ export async function POST(req: Request) {
       },
     });
 
-    return result.toAIStreamResponse();
+    result.pipeDataStreamToResponse(res);
 
   } catch (error: any) {
     console.error("AI ROUTE ERROR:", error);
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    res.status(500).json({ error: error.message });
   }
 }
