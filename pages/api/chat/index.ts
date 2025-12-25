@@ -1,6 +1,5 @@
 // @ts-nocheck
-import { openai } from '@ai-sdk/openai';
-import { streamText, tool, convertToCoreMessages } from 'ai';
+import OpenAI from 'openai';
 import { z } from 'zod';
 
 export const config = {
@@ -8,6 +7,10 @@ export const config = {
     bodyParser: true,
   },
 };
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
@@ -41,7 +44,7 @@ The user's current build configuration (Rims, Hubs, Specs, Prices, Lead Times) i
 `;
 
 export default async function handler(req: any, res: any) {
-  // 1. Manual CORS Setup
+  // CORS Headers
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
@@ -69,89 +72,32 @@ export default async function handler(req: any, res: any) {
       - Estimated Shop Lead Time: ${buildContext?.leadTime || 'Standard'} Days
     `;
 
-    // 2. Generate the AI Stream (Server-Side)
-    const result = await streamText({
-      model: openai('gpt-4o-mini'),
-      system: SYSTEM_PROMPT + contextInjection,
-      messages: convertToCoreMessages(messages),
-      maxSteps: 5, // Allow the AI to loop (use tools) internally
-      tools: {
-        check_live_inventory: tool({
-          description: 'Checks the real-time stock quantity of a specific product variant.',
-          parameters: z.object({
-            variantId: z.string().describe('The Shopify Variant ID (GID or numeric) to check.'),
-          }),
-          execute: async ({ variantId }) => {
-            const numericId = variantId.replace('gid://shopify/ProductVariant/', '');
-            try {
-              const response = await fetch(
-                `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-04/variants/${numericId}.json`,
-                {
-                  headers: {
-                    'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN || '',
-                  },
-                }
-              );
-              const data = await response.json();
-              const q = data.variant.inventory_quantity;
-              const policy = data.variant.inventory_policy;
-              
-              if (q > 0) return `In Stock: We have ${q} units available right now.`;
-              if (q <= 0 && policy === 'continue') return `Special Order: Currently out of stock, but available for order.`;
-              return `Sold Out: Currently unavailable.`;
-            } catch (error) {
-              return 'I could not verify the live inventory right now.';
-            }
-          },
-        }),
-        calculate_spoke_lengths: tool({
-          description: 'Calculates precise spoke lengths for a rim/hub combination using the internal engineering engine.',
-          parameters: z.object({
-            erd: z.number().describe('Effective Rim Diameter in mm'),
-            pcdLeft: z.number().describe('Hub Pitch Circle Diameter Left'),
-            pcdRight: z.number().describe('Hub Pitch Circle Diameter Right'),
-            flangeLeft: z.number().describe('Hub Flange Offset Left'),
-            flangeRight: z.number().describe('Hub Flange Offset Right'),
-            spokeCount: z.number().describe('Number of spokes (e.g., 28, 32)'),
-            crossPattern: z.number().describe('Lacing pattern (e.g., 2 or 3)'),
-          }),
-          execute: async (args) => {
-            try {
-              const response = await fetch(process.env.SPOKE_CALC_API_URL || '', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'x-internal-secret': process.env.SPOKE_CALC_API_SECRET || '',
-                },
-                body: JSON.stringify(args),
-              });
-              
-              if (!response.ok) throw new Error('Calculation service failed');
-              
-              const result = await response.json();
-              return `Calculated Lengths: Left ${result.left}mm, Right ${result.right}mm. (Note: We handle final rounding during the build).`;
-            } catch (error) {
-              return 'I tried to run the math, but there is an issue on our end I need to look into. I can estimate based on similar builds if you want.';
-            }
-          },
-        }),
-      },
-    });
+    // Add System Prompt to message history
+    const openAiMessages = [
+      { role: 'system', content: SYSTEM_PROMPT + contextInjection },
+      ...messages.map((m: any) => ({ role: m.role === 'agent' ? 'assistant' : m.role, content: m.content }))
+    ];
 
-    // 3. MANUAL STREAMING (The Fix)
-    // We set the headers for a stream
+    // Set up Streaming Response
     res.writeHead(200, {
       'Content-Type': 'text/plain; charset=utf-8',
       'Transfer-Encoding': 'chunked',
       'Connection': 'keep-alive'
     });
 
-    // We loop through the text parts as they generate and write them directly
-    for await (const textPart of result.textStream) {
-      res.write(textPart);
+    const stream = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: openAiMessages,
+      stream: true,
+    });
+
+    for await (const chunk of stream) {
+      const content = chunk.choices[0]?.delta?.content || '';
+      if (content) {
+        res.write(content);
+      }
     }
 
-    // We close the connection
     res.end();
 
   } catch (error: any) {
