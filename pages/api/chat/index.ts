@@ -119,8 +119,6 @@ export default async function handler(req: any, res: any) {
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
     const result = await streamText({
-      // FIXED: Using 'gemini-flash-latest' which appeared in your diagnostic list
-      // and supports standard tool definitions better than the 2.0 beta.
       model: google('gemini-flash-latest'),
       system: finalSystemPrompt,
       messages: messages.map((m: any) => ({
@@ -171,8 +169,9 @@ export default async function handler(req: any, res: any) {
       'Connection': 'keep-alive'
     });
 
+    // FIXED: Robust loop checks for undefined data before writing
     for await (const part of result.fullStream) {
-        if (part.type === 'text-delta') {
+        if (part.type === 'text-delta' && typeof part.textDelta === 'string') {
             res.write(part.textDelta);
         }
     }
