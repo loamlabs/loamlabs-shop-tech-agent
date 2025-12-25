@@ -1,5 +1,5 @@
 import { google } from '@ai-sdk/google';
-import { convertToCoreMessages, streamText, tool } from 'ai';
+import { streamText, tool } from 'ai';
 import { z } from 'zod';
 
 // --- PERSONA & STORE POLICY ---
@@ -54,7 +54,7 @@ export async function POST(req: Request) {
   return streamText({
     model: google('models/gemini-1.5-flash'),
     system: SYSTEM_PROMPT + contextInjection,
-    messages: convertToCoreMessages(messages),
+    messages: messages, // Direct pass-through, no conversion function needed
     tools: {
       // TOOL 1: Check Live Shopify Inventory
       check_live_inventory: tool({
