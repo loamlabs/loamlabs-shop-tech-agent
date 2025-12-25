@@ -4,7 +4,22 @@ import { z } from 'zod';
 
 export const maxDuration = 60;
 
-// --- PERSONA & STORE POLICY ---
+// --- 1. DEFINE SCHEMAS SEPARATELY (Fixes Type Errors) ---
+const InventorySchema = z.object({
+  variantId: z.string().describe('The Shopify Variant ID (GID or numeric) to check.'),
+});
+
+const SpokeCalcSchema = z.object({
+  erd: z.number().describe('Effective Rim Diameter in mm'),
+  pcdLeft: z.number().describe('Hub Pitch Circle Diameter Left'),
+  pcdRight: z.number().describe('Hub Pitch Circle Diameter Right'),
+  flangeLeft: z.number().describe('Hub Flange Offset Left'),
+  flangeRight: z.number().describe('Hub Flange Offset Right'),
+  spokeCount: z.number().describe('Number of spokes (e.g., 28, 32)'),
+  crossPattern: z.number().describe('Lacing pattern (e.g., 2 or 3)'),
+});
+
+// --- 2. PERSONA & STORE POLICY ---
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 You are speaking to a customer in the Custom Wheel Builder.
@@ -57,10 +72,8 @@ export async function POST(req: Request) {
     tools: {
       check_live_inventory: tool({
         description: 'Checks the real-time stock quantity of a specific product variant.',
-        parameters: z.object({
-          variantId: z.string().describe('The Shopify Variant ID (GID or numeric) to check.'),
-        }),
-        execute: async ({ variantId }: { variantId: string }) => {
+        parameters: InventorySchema,
+        execute: async ({ variantId }: z.infer<typeof InventorySchema>) => {
           const numericId = variantId.replace('gid://shopify/ProductVariant/', '');
           try {
             const response = await fetch(
@@ -85,24 +98,8 @@ export async function POST(req: Request) {
       }),
       calculate_spoke_lengths: tool({
         description: 'Calculates precise spoke lengths for a rim/hub combination using the internal engineering engine.',
-        parameters: z.object({
-          erd: z.number().describe('Effective Rim Diameter in mm'),
-          pcdLeft: z.number().describe('Hub Pitch Circle Diameter Left'),
-          pcdRight: z.number().describe('Hub Pitch Circle Diameter Right'),
-          flangeLeft: z.number().describe('Hub Flange Offset Left'),
-          flangeRight: z.number().describe('Hub Flange Offset Right'),
-          spokeCount: z.number().describe('Number of spokes (e.g., 28, 32)'),
-          crossPattern: z.number().describe('Lacing pattern (e.g., 2 or 3)'),
-        }),
-        execute: async (params: {
-          erd: number;
-          pcdLeft: number;
-          pcdRight: number;
-          flangeLeft: number;
-          flangeRight: number;
-          spokeCount: number;
-          crossPattern: number;
-        }) => {
+        parameters: SpokeCalcSchema,
+        execute: async (params: z.infer<typeof SpokeCalcSchema>) => {
           try {
             const response = await fetch(process.env.SPOKE_CALC_API_URL || '', {
               method: 'POST',
