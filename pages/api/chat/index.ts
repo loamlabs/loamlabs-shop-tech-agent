@@ -119,7 +119,9 @@ export default async function handler(req: any, res: any) {
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
     const result = await streamText({
-      model: google('gemini-2.0-flash-001'),
+      // FIXED: Using 'gemini-flash-latest' which appeared in your diagnostic list
+      // and supports standard tool definitions better than the 2.0 beta.
+      model: google('gemini-flash-latest'),
       system: finalSystemPrompt,
       messages: messages.map((m: any) => ({
         role: m.role,
@@ -130,7 +132,7 @@ export default async function handler(req: any, res: any) {
         lookup_product_info: tool({
           description: 'Searches the store inventory for products.',
           parameters: z.object({ 
-            query: z.string().describe("The name or specification of the component to search for (e.g. 'Onyx Vesper', 'Rear Hub 12x148')") 
+            query: z.string().describe("The name or specification of the component to search for") 
           }),
           execute: async ({ query }) => await lookupProductInfo(query),
         }),
@@ -143,7 +145,7 @@ export default async function handler(req: any, res: any) {
             flangeLeft: z.number().describe("Flange offset left"), 
             flangeRight: z.number().describe("Flange offset right"),
             spokeCount: z.number().describe("Total number of spokes"), 
-            crossPattern: z.number().describe("Spoke crossing pattern (e.g. 3)")
+            crossPattern: z.number().describe("Spoke crossing pattern")
           }),
           execute: async (args) => {
             try {
