@@ -102,7 +102,6 @@ async function lookupProductInfo(query: string) {
 }
 
 export default async function handler(req: any, res: any) {
-  // CORS Headers
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
@@ -169,11 +168,21 @@ export default async function handler(req: any, res: any) {
       'Connection': 'keep-alive'
     });
 
-    // FIXED: Robust loop checks for undefined data before writing
+    let hasSentText = false;
+
+    // DEBUG LOGGING LOOP
     for await (const part of result.fullStream) {
+        console.log("AI Stream Part Type:", part.type); // LOG TO VERCEL
         if (part.type === 'text-delta' && typeof part.textDelta === 'string') {
             res.write(part.textDelta);
+            hasSentText = true;
         }
+    }
+
+    // Fallback if AI was silent
+    if (!hasSentText) {
+      console.log("AI returned no text. Sending fallback.");
+      res.write("...");
     }
 
     res.end();
