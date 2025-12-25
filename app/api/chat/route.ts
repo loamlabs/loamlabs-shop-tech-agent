@@ -38,6 +38,17 @@ You are speaking to a customer in the Custom Wheel Builder.
 The user's current build configuration (Rims, Hubs, Specs, Prices, Lead Times) is injected into your first message. Use this data to answer specific questions.
 `;
 
+export async function OPTIONS(request: Request) {
+  return new Response(null, {
+    status: 200,
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    },
+  });
+}
+
 // Helper for GET requests (Health Check)
 export async function GET() {
   return new Response(JSON.stringify({ status: "Online", provider: "OpenAI" }), {
