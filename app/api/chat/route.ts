@@ -2,6 +2,8 @@ import { google } from '@ai-sdk/google';
 import { streamText, tool } from 'ai';
 import { z } from 'zod';
 
+export const maxDuration = 60;
+
 // --- PERSONA & STORE POLICY ---
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
@@ -34,12 +36,9 @@ You are speaking to a customer in the Custom Wheel Builder.
 The user's current build configuration (Rims, Hubs, Specs, Prices, Lead Times) is injected into your first message. Use this data to answer specific questions.
 `;
 
-export const maxDuration = 60; // Allow 60 seconds for execution
-
 export async function POST(req: Request) {
   const { messages, buildContext } = await req.json();
 
-  // Inject the Build Context into the System Prompt for this specific request
   const contextInjection = `
     [CURRENT BUILD STATE]:
     - Step: ${buildContext?.step || 'Unknown'}
@@ -51,21 +50,19 @@ export async function POST(req: Request) {
     - Estimated Shop Lead Time: ${buildContext?.leadTime || 'Standard'} Days
   `;
 
-  return streamText({
+  // 1. Perform the streamText operation
+  const result = streamText({
     model: google('models/gemini-1.5-flash'),
     system: SYSTEM_PROMPT + contextInjection,
-    messages: messages, // Direct pass-through, no conversion function needed
+    messages: messages,
     tools: {
-      // TOOL 1: Check Live Shopify Inventory
       check_live_inventory: tool({
         description: 'Checks the real-time stock quantity of a specific product variant.',
         parameters: z.object({
           variantId: z.string().describe('The Shopify Variant ID (GID or numeric) to check.'),
         }),
         execute: async ({ variantId }) => {
-          // Extract numeric ID if GID is passed
           const numericId = variantId.replace('gid://shopify/ProductVariant/', '');
-          
           try {
             const response = await fetch(
               `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-04/variants/${numericId}.json`,
@@ -87,8 +84,6 @@ export async function POST(req: Request) {
           }
         },
       }),
-
-      // TOOL 2: Calculate Spoke Lengths (Service-to-Service)
       calculate_spoke_lengths: tool({
         description: 'Calculates precise spoke lengths for a rim/hub combination using the internal engineering engine.',
         parameters: z.object({
@@ -122,4 +117,7 @@ export async function POST(req: Request) {
       }),
     },
   });
+
+  // 2. Return the Data Stream Response (This fixes the error)
+  return result.toDataStreamResponse();
 }
