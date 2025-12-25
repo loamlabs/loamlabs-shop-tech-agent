@@ -50,7 +50,6 @@ export async function POST(req: Request) {
     - Estimated Shop Lead Time: ${buildContext?.leadTime || 'Standard'} Days
   `;
 
-  // 1. Perform the streamText operation
   const result = streamText({
     model: google('models/gemini-1.5-flash'),
     system: SYSTEM_PROMPT + contextInjection,
@@ -61,7 +60,7 @@ export async function POST(req: Request) {
         parameters: z.object({
           variantId: z.string().describe('The Shopify Variant ID (GID or numeric) to check.'),
         }),
-        execute: async ({ variantId }) => {
+        execute: async ({ variantId }: { variantId: string }) => {
           const numericId = variantId.replace('gid://shopify/ProductVariant/', '');
           try {
             const response = await fetch(
@@ -95,7 +94,15 @@ export async function POST(req: Request) {
           spokeCount: z.number().describe('Number of spokes (e.g., 28, 32)'),
           crossPattern: z.number().describe('Lacing pattern (e.g., 2 or 3)'),
         }),
-        execute: async (params) => {
+        execute: async (params: {
+          erd: number;
+          pcdLeft: number;
+          pcdRight: number;
+          flangeLeft: number;
+          flangeRight: number;
+          spokeCount: number;
+          crossPattern: number;
+        }) => {
           try {
             const response = await fetch(process.env.SPOKE_CALC_API_URL || '', {
               method: 'POST',
@@ -118,6 +125,5 @@ export async function POST(req: Request) {
     },
   });
 
-  // 2. Return the Data Stream Response (This fixes the error)
   return result.toDataStreamResponse();
 }
