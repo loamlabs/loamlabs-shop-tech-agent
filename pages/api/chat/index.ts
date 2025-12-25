@@ -119,10 +119,12 @@ export default async function handler(req: any, res: any) {
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
     const result = await streamText({
-      model: google('models/gemini-1.5-flash'), // UPDATED: Using Flash 1.5 as per project spec
+      // FIXED: Removed 'models/' prefix. The SDK handles this.
+      // If this still fails, your Google Cloud Project might require 'gemini-1.5-flash-001'
+      model: google('gemini-1.5-flash'), 
       system: finalSystemPrompt,
       messages: convertToCoreMessages(messages),
-      maxSteps: 5, // Allow multi-step tool use
+      maxSteps: 5,
       tools: {
         lookup_product_info: tool({
           description: 'Searches the store. Query should be the Product Name or Spec (e.g. "Rear Hub 12x148").',
@@ -161,7 +163,7 @@ export default async function handler(req: any, res: any) {
       'Connection': 'keep-alive'
     });
 
-    // Stream Loop: Filters out internal tool steps and sends only text deltas to frontend
+    // Stream Loop
     for await (const part of result.fullStream) {
         if (part.type === 'text-delta') {
             res.write(part.textDelta);
