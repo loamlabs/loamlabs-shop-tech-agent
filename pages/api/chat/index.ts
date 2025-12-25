@@ -122,13 +122,24 @@ export default async function handler(req: any, res: any) {
         lookup_product_info: tool({
           description: 'Searches the store inventory for products.',
           parameters: z.object({ 
-            query: z.string().describe("The name or specification of the component to search for") 
+            query: z.string().describe("A SINGLE search string combining Brand, Model, and Spec (e.g. 'Industry Nine Hydra Rear').") 
           }),
-          // FIXED: Robust argument handling
+          // FIXED: Intelligent Argument Reconstruction
           execute: async (args) => {
             console.log("[Tool Debug] Raw Args:", JSON.stringify(args));
-            // Fallback: Use 'query', or 'product', or just the first value found
-            const q = args.query || args.product || Object.values(args)[0] || "undefined";
+            
+            let q = args.query;
+            
+            // If AI split the args (e.g. { brand: 'I9', model: 'Hydra' }), join them back together
+            if (!q || typeof q !== 'string') {
+                q = Object.values(args)
+                    .filter(v => v && typeof v === 'string' && v.trim().length > 0)
+                    .join(" ");
+            }
+            
+            // Fallback
+            if (!q) q = "undefined";
+            
             return await lookupProductInfo(String(q));
           },
         }),
@@ -168,8 +179,7 @@ export default async function handler(req: any, res: any) {
 
     for await (const part of result.fullStream) {
         if (part.type === 'text-delta') {
-             // Keep debug log to monitor stream health
-             // console.log("DEBUG PART:", JSON.stringify(part));
+            // console.log("DEBUG PART:", JSON.stringify(part));
         }
 
         const textContent = part.textDelta || part.text || part.content || "";
