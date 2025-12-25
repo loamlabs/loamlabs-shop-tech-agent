@@ -3,9 +3,10 @@ import { openai } from '@ai-sdk/openai';
 import { streamText, tool, convertToCoreMessages } from 'ai';
 import { z } from 'zod';
 
-// CRITICAL: Switch to Edge Runtime to support AI Streaming natively
 export const config = {
-  runtime: 'edge',
+  api: {
+    bodyParser: true,
+  },
 };
 
 const SYSTEM_PROMPT = `
@@ -39,21 +40,23 @@ You are speaking to a customer in the Custom Wheel Builder.
 The user's current build configuration (Rims, Hubs, Specs, Prices, Lead Times) is injected into your first message. Use this data to answer specific questions.
 `;
 
-export default async function handler(req: Request) {
-  // 1. Manual CORS Preflight Check
+export default async function handler(req: any, res: any) {
+  // 1. Manual CORS Setup
+  res.setHeader('Access-Control-Allow-Credentials', true);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
+  );
+
   if (req.method === 'OPTIONS') {
-    return new Response(null, {
-      status: 200,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      },
-    });
+    res.status(200).end();
+    return;
   }
 
   try {
-    const { messages, buildContext } = await req.json();
+    const { messages, buildContext } = req.body;
 
     const contextInjection = `
       [CURRENT BUILD STATE]:
@@ -66,11 +69,12 @@ export default async function handler(req: Request) {
       - Estimated Shop Lead Time: ${buildContext?.leadTime || 'Standard'} Days
     `;
 
+    // 2. Generate the AI Stream (Server-Side)
     const result = await streamText({
       model: openai('gpt-4o-mini'),
       system: SYSTEM_PROMPT + contextInjection,
       messages: convertToCoreMessages(messages),
-      maxSteps: 5,
+      maxSteps: 5, // Allow the AI to loop (use tools) internally
       tools: {
         check_live_inventory: tool({
           description: 'Checks the real-time stock quantity of a specific product variant.',
@@ -111,7 +115,7 @@ export default async function handler(req: Request) {
             spokeCount: z.number().describe('Number of spokes (e.g., 28, 32)'),
             crossPattern: z.number().describe('Lacing pattern (e.g., 2 or 3)'),
           }),
-          execute: async (params) => {
+          execute: async (args) => {
             try {
               const response = await fetch(process.env.SPOKE_CALC_API_URL || '', {
                 method: 'POST',
@@ -119,7 +123,7 @@ export default async function handler(req: Request) {
                   'Content-Type': 'application/json',
                   'x-internal-secret': process.env.SPOKE_CALC_API_SECRET || '',
                 },
-                body: JSON.stringify(params),
+                body: JSON.stringify(args),
               });
               
               if (!response.ok) throw new Error('Calculation service failed');
@@ -134,23 +138,24 @@ export default async function handler(req: Request) {
       },
     });
 
-    // Return using the SDK's native response helper, adding CORS headers
-    return result.toTextStreamResponse({
-        headers: {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-        }
+    // 3. MANUAL STREAMING (The Fix)
+    // We set the headers for a stream
+    res.writeHead(200, {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Transfer-Encoding': 'chunked',
+      'Connection': 'keep-alive'
     });
+
+    // We loop through the text parts as they generate and write them directly
+    for await (const textPart of result.textStream) {
+      res.write(textPart);
+    }
+
+    // We close the connection
+    res.end();
 
   } catch (error: any) {
     console.error("AI ROUTE ERROR:", error);
-    return new Response(JSON.stringify({ error: error.message }), { 
-        status: 500,
-        headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*' 
-        } 
-    });
+    res.status(500).json({ error: error.message });
   }
 }
