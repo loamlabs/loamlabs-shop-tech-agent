@@ -124,7 +124,13 @@ export default async function handler(req: any, res: any) {
           parameters: z.object({ 
             query: z.string().describe("The name or specification of the component to search for") 
           }),
-          execute: async ({ query }) => await lookupProductInfo(query),
+          // FIXED: Robust argument handling
+          execute: async (args) => {
+            console.log("[Tool Debug] Raw Args:", JSON.stringify(args));
+            // Fallback: Use 'query', or 'product', or just the first value found
+            const q = args.query || args.product || Object.values(args)[0] || "undefined";
+            return await lookupProductInfo(String(q));
+          },
         }),
         calculate_spoke_lengths: tool({
           description: 'Calculates precise spoke lengths based on hub and rim geometry.',
@@ -160,14 +166,12 @@ export default async function handler(req: any, res: any) {
 
     let hasSentText = false;
 
-    // DEBUGGING THE CHUNK STRUCTURE
     for await (const part of result.fullStream) {
-        // Log the full object to see where the text is hiding
         if (part.type === 'text-delta') {
-            console.log("DEBUG PART:", JSON.stringify(part));
+             // Keep debug log to monitor stream health
+             // console.log("DEBUG PART:", JSON.stringify(part));
         }
 
-        // Try multiple standard properties
         const textContent = part.textDelta || part.text || part.content || "";
         
         if (part.type === 'text-delta' && typeof textContent === 'string' && textContent.length > 0) {
