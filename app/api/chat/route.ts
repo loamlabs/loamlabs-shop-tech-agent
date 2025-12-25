@@ -4,6 +4,7 @@ import { streamText, tool, convertToCoreMessages } from 'ai';
 import { z } from 'zod';
 
 export const maxDuration = 60;
+export const dynamic = 'force-dynamic'; // Force dynamic handling
 
 // --- PERSONA & STORE POLICY ---
 const SYSTEM_PROMPT = `
@@ -37,6 +38,15 @@ You are speaking to a customer in the Custom Wheel Builder.
 The user's current build configuration (Rims, Hubs, Specs, Prices, Lead Times) is injected into your first message. Use this data to answer specific questions.
 `;
 
+// Helper for GET requests (Health Check)
+export async function GET() {
+  return new Response(JSON.stringify({ status: "Online", provider: "OpenAI" }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// Main POST Handler
 export async function POST(req: Request) {
   try {
     const { messages, buildContext } = await req.json();
@@ -120,7 +130,7 @@ export async function POST(req: Request) {
       },
     });
 
-    return result.toTextStreamResponse();
+    return result.toAIStreamResponse();
 
   } catch (error: any) {
     console.error("AI ROUTE ERROR:", error);
