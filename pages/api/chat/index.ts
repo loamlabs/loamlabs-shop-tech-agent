@@ -11,7 +11,7 @@ export const config = {
 };
 
 const STANDARD_SHOP_BUILD_DAYS = 5;
-const SEARCH_LIMIT = 20; // Reduced from 50 to save overhead
+const SEARCH_LIMIT = 20;
 
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
@@ -20,15 +20,20 @@ You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 - Professional, technical, direct, and "down to earth."
 - Identity: "LoamLabs Automated Lead Tech".
 
+**CONTEXTUAL INTELLIGENCE:**
+You have access to the user's current builder selections (see [CONTEXT] below).
+1. **CHECK SPECS:** If the user asks "Is X in stock?", first check if they have selected an **Axle Standard**, **Brake Interface**, or **Spoke Count** in the builder.
+2. **NARROW DOWN:** Use these selections to filter the search results mentally.
+3. **ASK TO CLARIFY:** If the user hasn't selected an Axle or Spoke Count yet, and the search returns many options, **ASK THEM** for these details to help find the exact part (e.g., "Are you looking for Boost or SuperBoost?").
+
 **CRITICAL SEARCH RULES:**
-1. **SEARCH SIMPLY:** Use ONLY the core Brand or Model name.
-2. **NO FLUFF:** NEVER include words like "stock", "available", "hub".
-3. **MANDATORY RESPONSE:** After the tool returns a list of products, you **MUST** write a response summarizing what was found. Do not stay silent.
-4. **INVENTORY PRECISION:** If the tool lists specific variants in stock, report them explicitly.
-5. **LEAD TIME MATH:** In Stock = ~${STANDARD_SHOP_BUILD_DAYS} days. Out of Stock = Mfg Lead Time + ${STANDARD_SHOP_BUILD_DAYS} days.
+1. **SEARCH SIMPLY:** Use ONLY the core Brand or Model name (e.g. "Hydra"). Clean out words like "stock" or "hub".
+2. **MANDATORY SPEECH:** After using a tool, you **MUST** speak to the user. Explain what you found. NEVER stay silent after a tool result.
+3. **INVENTORY PRECISION:** If the tool lists specific variants (e.g. "Black / 32h"), report that exact availability.
+4. **LEAD TIME:** In Stock = ~${STANDARD_SHOP_BUILD_DAYS} days. Out of Stock = Mfg Lead Time + ${STANDARD_SHOP_BUILD_DAYS} days.
 
 **CONTEXT:**
-The user's current selections are injected. If they ask about something NOT selected, use the 'lookup_product_info' tool.
+The user's current selections are injected below. Use this to guide your questions.
 `;
 
 async function lookupProductInfo(query: string) {
@@ -85,22 +90,24 @@ async function lookupProductInfo(query: string) {
       p.variants.edges.forEach((v: any) => {
           const node = v.node;
           const name = node.title.replace('Default Title', 'Standard');
-          if (node.inventoryQuantity > 0) {
-              inStockVariants.push(`${name} (Qty: ${node.inventoryQuantity})`);
+          // Intelligent Stock Check: Only list if physically in stock OR allow oversell
+          if (node.inventoryQuantity > 0 || node.inventoryPolicy === 'CONTINUE') {
+              const qtyMsg = node.inventoryQuantity > 0 ? `Qty: ${node.inventoryQuantity}` : "Made to Order";
+              inStockVariants.push(`${name} (${qtyMsg})`);
           }
       });
       let stockSummary = "Status: Special Order Only (Out of Stock)";
-      if (inStockVariants.length > 0) stockSummary = `> IN STOCK: ${inStockVariants.join(', ')}`;
+      if (inStockVariants.length > 0) stockSummary = `> AVAILABLE VARIANTS: ${inStockVariants.join(', ')}`;
       return `ITEM: ${p.title} | ${stockSummary} | Mfg Lead Time: ${rawLeadTime} days`;
     });
 
     if (products.length === 0) return "No products found matching that query. Try a simpler search term.";
     
-    // LIMIT RESULTS TO TOP 5 TO PREVENT CONTEXT OVERLOAD
     const limitedProducts = products.slice(0, 5);
     console.log(`[Tool] Returning top ${limitedProducts.length} results to AI.`);
     
-    return limitedProducts.join("\n") + (count > 5 ? `\n...(and ${count - 5} more items)` : "");
+    // Force the AI to acknowledge the data
+    return `FOUND ${count} ITEMS. HERE ARE THE TOP 5:\n` + limitedProducts.join("\n") + "\n\n[INSTRUCTION TO AI: Summarize these options for the user based on their context.]";
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
@@ -140,7 +147,6 @@ export default async function handler(req: any, res: any) {
           }),
           execute: async (args) => {
             console.log("[Tool Debug] Raw Args:", JSON.stringify(args));
-            
             let q = args.query;
             if (!q || typeof q !== 'string') {
                 q = Object.values(args)
@@ -151,7 +157,6 @@ export default async function handler(req: any, res: any) {
                 q = q.replace(/\b(stock|available|hub|hubs|pair|set|in)\b/gi, '').trim();
             }
             if (!q) q = "undefined";
-            
             return await lookupProductInfo(String(q));
           },
         }),
@@ -190,9 +195,7 @@ export default async function handler(req: any, res: any) {
     let hasSentText = false;
 
     for await (const part of result.fullStream) {
-        // Debug Log: Check what parts are being emitted (tool-call, tool-result, text-delta)
         console.log("Stream Part Type:", part.type); 
-
         const textContent = part.textDelta || part.text || part.content || "";
         if (part.type === 'text-delta' && typeof textContent === 'string' && textContent.length > 0) {
             res.write(textContent);
