@@ -53,7 +53,7 @@ export async function POST(req: Request) {
     `;
 
     const result = await streamText({
-      model: google('models/gemini-pro'),
+      model: google('models/gemini-1.0-pro'),
       system: SYSTEM_PROMPT + contextInjection,
       messages: convertToCoreMessages(messages),
       tools: {
