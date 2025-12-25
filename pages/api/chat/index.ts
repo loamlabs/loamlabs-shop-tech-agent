@@ -3,7 +3,6 @@ import { google } from '@ai-sdk/google';
 import { streamText, tool } from 'ai'; 
 import { z } from 'zod';
 
-// Ensure we are using Node runtime for manual response piping
 export const config = {
   api: {
     bodyParser: true,
@@ -73,9 +72,7 @@ async function lookupProductInfo(query: string) {
     const products = data.data.products.edges.map((e: any) => {
       const p = e.node;
       const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 0;
-      
       const inStockVariants: string[] = [];
-      
       p.variants.edges.forEach((v: any) => {
           const node = v.node;
           const name = node.title.replace('Default Title', 'Standard');
@@ -83,12 +80,8 @@ async function lookupProductInfo(query: string) {
               inStockVariants.push(`${name} (Qty: ${node.inventoryQuantity})`);
           }
       });
-
       let stockSummary = "Status: Special Order Only (Out of Stock)";
-      if (inStockVariants.length > 0) {
-          stockSummary = `> IN STOCK: ${inStockVariants.join(', ')}`;
-      }
-
+      if (inStockVariants.length > 0) stockSummary = `> IN STOCK: ${inStockVariants.join(', ')}`;
       return `ITEM: ${p.title} | ${stockSummary} | Mfg Lead Time: ${rawLeadTime} days`;
     });
 
@@ -148,10 +141,7 @@ export default async function handler(req: any, res: any) {
             try {
               const r = await fetch(process.env.SPOKE_CALC_API_URL || '', {
                 method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'x-internal-secret': process.env.SPOKE_CALC_API_SECRET || '',
-                },
+                headers: { 'Content-Type': 'application/json', 'x-internal-secret': process.env.SPOKE_CALC_API_SECRET || '' },
                 body: JSON.stringify(args),
               });
               const d = await r.json();
@@ -170,16 +160,22 @@ export default async function handler(req: any, res: any) {
 
     let hasSentText = false;
 
-    // DEBUG LOGGING LOOP
+    // DEBUGGING THE CHUNK STRUCTURE
     for await (const part of result.fullStream) {
-        console.log("AI Stream Part Type:", part.type); // LOG TO VERCEL
-        if (part.type === 'text-delta' && typeof part.textDelta === 'string') {
-            res.write(part.textDelta);
+        // Log the full object to see where the text is hiding
+        if (part.type === 'text-delta') {
+            console.log("DEBUG PART:", JSON.stringify(part));
+        }
+
+        // Try multiple standard properties
+        const textContent = part.textDelta || part.text || part.content || "";
+        
+        if (part.type === 'text-delta' && typeof textContent === 'string' && textContent.length > 0) {
+            res.write(textContent);
             hasSentText = true;
         }
     }
 
-    // Fallback if AI was silent
     if (!hasSentText) {
       console.log("AI returned no text. Sending fallback.");
       res.write("...");
