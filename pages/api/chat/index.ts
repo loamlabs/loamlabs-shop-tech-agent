@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { openai } from '@ai-sdk/openai';
-import { streamText, tool, convertToCoreMessages } from 'ai';
+import { streamText, convertToCoreMessages } from 'ai';
 import { z } from 'zod';
 
 export const config = {
@@ -73,14 +73,14 @@ export default async function handler(req: any, res: any) {
       model: openai('gpt-4o-mini'),
       system: SYSTEM_PROMPT + contextInjection,
       messages: convertToCoreMessages(messages),
-      maxSteps: 5, // CRITICAL: Allows server to run tools and loop back
+      maxSteps: 5, 
       tools: {
-        check_live_inventory: tool({
+        check_live_inventory: {
           description: 'Checks the real-time stock quantity of a specific product variant.',
           parameters: z.object({
             variantId: z.string().describe('The Shopify Variant ID (GID or numeric) to check.'),
           }),
-          execute: async ({ variantId }) => {
+          execute: async ({ variantId }: { variantId: string }) => {
             const numericId = variantId.replace('gid://shopify/ProductVariant/', '');
             try {
               const response = await fetch(
@@ -102,8 +102,8 @@ export default async function handler(req: any, res: any) {
               return 'I could not verify the live inventory right now.';
             }
           },
-        }),
-        calculate_spoke_lengths: tool({
+        },
+        calculate_spoke_lengths: {
           description: 'Calculates precise spoke lengths for a rim/hub combination using the internal engineering engine.',
           parameters: z.object({
             erd: z.number().describe('Effective Rim Diameter in mm'),
@@ -114,7 +114,7 @@ export default async function handler(req: any, res: any) {
             spokeCount: z.number().describe('Number of spokes (e.g., 28, 32)'),
             crossPattern: z.number().describe('Lacing pattern (e.g., 2 or 3)'),
           }),
-          execute: async (args) => {
+          execute: async (args: any) => {
             try {
               const response = await fetch(process.env.SPOKE_CALC_API_URL || '', {
                 method: 'POST',
@@ -133,12 +133,22 @@ export default async function handler(req: any, res: any) {
               return 'I tried to run the math, but there is an issue on our end I need to look into. I can estimate based on similar builds if you want.';
             }
           },
-        }),
+        },
       },
     });
 
-    // CRITICAL FIX: Use Text Stream instead of Data Stream for Vanilla JS Compatibility
-    result.pipeTextStreamToResponse(res);
+    // MANUAL STREAMING to fix "stream-start" error
+    res.writeHead(200, {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Transfer-Encoding': 'chunked',
+    });
+
+    // Loop over the text stream and write chunks directly
+    for await (const textPart of result.textStream) {
+      res.write(textPart);
+    }
+
+    res.end();
 
   } catch (error: any) {
     console.error("AI ROUTE ERROR:", error);
