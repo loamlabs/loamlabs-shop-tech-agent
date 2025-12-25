@@ -90,7 +90,7 @@ async function lookupProductInfo(query: string) {
       p.variants.edges.forEach((v: any) => {
           const node = v.node;
           const name = node.title.replace('Default Title', 'Standard');
-          // Intelligent Stock Check: Only list if physically in stock OR allow oversell
+          // Intelligent Stock Check
           if (node.inventoryQuantity > 0 || node.inventoryPolicy === 'CONTINUE') {
               const qtyMsg = node.inventoryQuantity > 0 ? `Qty: ${node.inventoryQuantity}` : "Made to Order";
               inStockVariants.push(`${name} (${qtyMsg})`);
@@ -106,8 +106,10 @@ async function lookupProductInfo(query: string) {
     const limitedProducts = products.slice(0, 5);
     console.log(`[Tool] Returning top ${limitedProducts.length} results to AI.`);
     
-    // Force the AI to acknowledge the data
-    return `FOUND ${count} ITEMS. HERE ARE THE TOP 5:\n` + limitedProducts.join("\n") + "\n\n[INSTRUCTION TO AI: Summarize these options for the user based on their context.]";
+    // Strong Prompt Injection to force the AI to speak
+    return `[SYSTEM DATA]: Found ${count} matches. Top 5 listed below.\n` + 
+           limitedProducts.join("\n") + 
+           `\n\n[INSTRUCTION]: You must now summarize these specific options for the user. Do not stop.`;
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
@@ -132,13 +134,15 @@ export default async function handler(req: any, res: any) {
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
     const result = await streamText({
-      model: google('gemini-flash-latest'),
+      // SWITCHED TO PRO for better reasoning and tool follow-through
+      model: google('gemini-pro-latest'),
       system: finalSystemPrompt,
       messages: messages.map((m: any) => ({
         role: m.role,
         content: m.content
       })),
       maxSteps: 5,
+      toolChoice: 'auto', // Explicitly allow tools
       tools: {
         lookup_product_info: tool({
           description: 'Searches the store inventory for products.',
@@ -147,6 +151,7 @@ export default async function handler(req: any, res: any) {
           }),
           execute: async (args) => {
             console.log("[Tool Debug] Raw Args:", JSON.stringify(args));
+            
             let q = args.query;
             if (!q || typeof q !== 'string') {
                 q = Object.values(args)
@@ -157,6 +162,7 @@ export default async function handler(req: any, res: any) {
                 q = q.replace(/\b(stock|available|hub|hubs|pair|set|in)\b/gi, '').trim();
             }
             if (!q) q = "undefined";
+            
             return await lookupProductInfo(String(q));
           },
         }),
