@@ -145,4 +145,86 @@ export default async function handler(req: any, res: any) {
     // 1. Prepare Messages
     const openAiMessages = [
       { role: 'system', content: SYSTEM_PROMPT + contextInjection },
-      ...messages.map((m: any) => ({ role: m.role === 'agent' ? 'assistant'
+      ...messages.map((m: any) => ({ role: m.role === 'agent' ? 'assistant' : m.role, content: m.content }))
+    ];
+
+    // 2. Define Tools Schema (Native OpenAI Format)
+    const tools = [
+      {
+        type: "function",
+        function: {
+          name: "lookup_product_info",
+          description: "Searches the store for a product (hubs, rims, etc) to check its Inventory Status and Lead Time Metafield.",
+          parameters: {
+            type: "object",
+            properties: {
+              query: {
+                type: "string",
+                description: "The name of the product to search for (e.g. 'Hydra', 'Onyx Vesper', 'Reserve 30')",
+              },
+            },
+            required: ["query"],
+          },
+        },
+      }
+    ];
+
+    // 3. First Call to OpenAI (Decide if tool is needed)
+    const firstResponse = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: openAiMessages,
+      tools: tools,
+      tool_choice: "auto",
+    });
+
+    const responseMessage = firstResponse.choices[0].message;
+    const toolCalls = responseMessage.tool_calls;
+
+    // 4. Handle Tool Call (Server-Side Loop)
+    if (toolCalls) {
+      openAiMessages.push(responseMessage); // Add AI's intent to history
+
+      for (const toolCall of toolCalls) {
+        const functionName = toolCall.function.name;
+        const functionArgs = JSON.parse(toolCall.function.arguments);
+
+        if (functionName === "lookup_product_info") {
+          // Execute Search
+          const functionResponse = await lookupProductInfo(functionArgs.query);
+          
+          // Feed result back to AI
+          openAiMessages.push({
+            tool_call_id: toolCall.id,
+            role: "tool",
+            name: functionName,
+            content: functionResponse,
+          });
+        }
+      }
+    }
+
+    // 5. Final Streaming Response (With Data)
+    res.writeHead(200, {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Transfer-Encoding': 'chunked',
+      'Connection': 'keep-alive'
+    });
+
+    const stream = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: openAiMessages,
+      stream: true,
+    });
+
+    for await (const chunk of stream) {
+      const content = chunk.choices[0]?.delta?.content || '';
+      if (content) res.write(content);
+    }
+
+    res.end();
+
+  } catch (error: any) {
+    console.error("AI ROUTE ERROR:", error);
+    res.status(500).json({ error: error.message });
+  }
+}
