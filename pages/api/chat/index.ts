@@ -3,6 +3,7 @@ import { google } from '@ai-sdk/google';
 import { streamText, tool, convertToCoreMessages } from 'ai';
 import { z } from 'zod';
 
+// Ensure we are using Node runtime for manual response piping
 export const config = {
   api: {
     bodyParser: true,
@@ -101,7 +102,7 @@ async function lookupProductInfo(query: string) {
 }
 
 export default async function handler(req: any, res: any) {
-  // CORS
+  // CORS Headers - Vital for Shopify Frontend
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
@@ -118,10 +119,10 @@ export default async function handler(req: any, res: any) {
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
     const result = await streamText({
-      model: google('models/gemini-pro'), // FALLBACK TO STABLE MODEL
+      model: google('models/gemini-1.5-flash'), // UPDATED: Using Flash 1.5 as per project spec
       system: finalSystemPrompt,
       messages: convertToCoreMessages(messages),
-      maxSteps: 5,
+      maxSteps: 5, // Allow multi-step tool use
       tools: {
         lookup_product_info: tool({
           description: 'Searches the store. Query should be the Product Name or Spec (e.g. "Rear Hub 12x148").',
@@ -153,14 +154,14 @@ export default async function handler(req: any, res: any) {
       },
     });
 
-    // Manual Stream Loop (Adapted for Google Provider structure)
+    // Initialize Manual Stream Response
     res.writeHead(200, {
       'Content-Type': 'text/plain; charset=utf-8',
       'Transfer-Encoding': 'chunked',
       'Connection': 'keep-alive'
     });
 
-    // Google provider streams text deltas differently, this captures them
+    // Stream Loop: Filters out internal tool steps and sends only text deltas to frontend
     for await (const part of result.fullStream) {
         if (part.type === 'text-delta') {
             res.write(part.textDelta);
