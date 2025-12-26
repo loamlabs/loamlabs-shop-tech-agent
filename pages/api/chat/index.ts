@@ -20,14 +20,20 @@ You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 - Professional, technical, direct, and "down to earth."
 - Identity: "LoamLabs Automated Lead Tech".
 
-**CRITICAL RULES:**
-1. **ALWAYS REPLY:** If a tool returns data, you **MUST** generate a text response summarizing it for the user. Do not stop.
-2. **SEARCH SIMPLY:** Use ONLY the core Brand or Model name (e.g. "Hydra").
-3. **INVENTORY PRECISION:** Report specific variants that are in stock.
+**CONTEXTUAL INTELLIGENCE:**
+You have access to the user's current builder selections (see [CONTEXT] below).
+1. **CHECK SPECS:** If the user asks "Is X in stock?", first check if they have selected an **Axle Standard**, **Brake Interface**, or **Spoke Count** in the builder.
+2. **NARROW DOWN:** Use these selections to filter the search results mentally.
+3. **ASK TO CLARIFY:** If the user hasn't selected an Axle or Spoke Count yet, and the search returns many options, **ASK THEM** for these details to help find the exact part.
+
+**CRITICAL SEARCH RULES:**
+1. **SEARCH SIMPLY:** Use ONLY the core Brand or Model name (e.g. "Hydra").
+2. **MANDATORY SPEECH:** After using a tool, you **MUST** speak to the user. Explain what you found. NEVER stay silent after a tool result.
+3. **INVENTORY PRECISION:** If the tool lists specific variants (e.g. "Black / 32h"), report that exact availability.
 4. **LEAD TIME:** In Stock = ~${STANDARD_SHOP_BUILD_DAYS} days. Out of Stock = Mfg Lead Time + ${STANDARD_SHOP_BUILD_DAYS} days.
 
 **CONTEXT:**
-The user's current selections are injected below.
+The user's current selections are injected below. Use this to guide your questions.
 `;
 
 async function lookupProductInfo(query: string) {
@@ -99,11 +105,9 @@ async function lookupProductInfo(query: string) {
     const limitedProducts = products.slice(0, 5);
     console.log(`[Tool] Returning top ${limitedProducts.length} results to AI.`);
     
-    // HEAVY HANDED INSTRUCTION TO FORCE A REPLY
-    return `[DATA START]\n` + 
+    return `[SYSTEM DATA]: Found ${count} matches. Top 5 listed below.\n` + 
            limitedProducts.join("\n") + 
-           `\n[DATA END]\n\n` + 
-           `[SYSTEM COMMAND]: The user is waiting. You must now write a response summarizing the available ${count} options above. Mention the "Available Variants" specifically.`;
+           `\n\n[INSTRUCTION]: Summarize these options for the user now.`;
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
@@ -128,14 +132,22 @@ export default async function handler(req: any, res: any) {
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
     const result = await streamText({
-      // Reverting to the known working model version
-      model: google('gemini-1.5-flash-001'),
+      // USE THE MODEL CONFIRMED IN YOUR LOGS
+      model: google('gemini-2.0-flash-001', {
+        safetySettings: [
+            { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+            { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+            { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+            { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+        ]
+      }),
       system: finalSystemPrompt,
       messages: messages.map((m: any) => ({
         role: m.role,
         content: m.content
       })),
       maxSteps: 5,
+      // SIMPLIFIED TOOLS - Removing Spoke Calculator to isolate the 400 Schema Error
       tools: {
         lookup_product_info: tool({
           description: 'Searches the store inventory for products.',
@@ -155,33 +167,7 @@ export default async function handler(req: any, res: any) {
             return await lookupProductInfo(String(q));
           },
         }),
-        calculate_spoke_lengths: tool({
-          description: 'Calculates precise spoke lengths based on hub and rim geometry.',
-          parameters: z.object({
-            erd: z.number().describe("Effective Rim Diameter in mm"), 
-            pcdLeft: z.number().describe("Pitch Circle Diameter of left flange"), 
-            pcdRight: z.number().describe("Pitch Circle Diameter of right flange"),
-            flangeLeft: z.number().describe("Flange offset left"), 
-            flangeRight: z.number().describe("Flange offset right"),
-            spokeCount: z.number().describe("Total number of spokes"), 
-            crossPattern: z.number().describe("Spoke crossing pattern")
-          }),
-          execute: async (args) => {
-            try {
-              const r = await fetch(process.env.SPOKE_CALC_API_URL || '', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'x-internal-secret': process.env.SPOKE_CALC_API_SECRET || '' },
-                body: JSON.stringify(args),
-              });
-              const d = await r.json();
-              return `Calculated: Left ${d.left}mm, Right ${d.right}mm`;
-            } catch (e) { return "Calc Error"; }
-          },
-        }),
       },
-      onStepFinish: (step) => {
-        console.log(`[Step Debug] FinishReason: ${step.finishReason}, ToolCalls: ${step.toolCalls.length}`);
-      }
     });
 
     res.writeHead(200, {
@@ -193,9 +179,6 @@ export default async function handler(req: any, res: any) {
     let hasSentText = false;
 
     for await (const part of result.fullStream) {
-        // Debugging output stream types
-        if(part.type !== 'text-delta') console.log(`Stream Part: ${part.type}`);
-
         const textContent = part.textDelta || part.text || part.content || "";
         if (part.type === 'text-delta' && typeof textContent === 'string' && textContent.length > 0) {
             res.write(textContent);
