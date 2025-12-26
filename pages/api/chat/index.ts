@@ -99,16 +99,10 @@ async function lookupProductInfo(query: string) {
     const limitedProducts = products.slice(0, 5);
     console.log(`[Tool] Returning top ${limitedProducts.length} results to AI.`);
     
-    // FORMATTED AS A SYSTEM COMMAND TO FORCE A REPLY
-    return `<tool_result>
-    <count>${count}</count>
-    <items>
-    ${limitedProducts.join("\n")}
-    </items>
-    <instruction>
-    You have received product data. You MUST now summarize these options for the user. Do not end the turn.
-    </instruction>
-    </tool_result>`;
+    return `[DATA START]\n` + 
+           limitedProducts.join("\n") + 
+           `\n[DATA END]\n\n` + 
+           `[SYSTEM COMMAND]: The user is waiting. You must now write a response summarizing the available ${count} options above. Mention the "Available Variants" specifically.`;
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
@@ -133,8 +127,16 @@ export default async function handler(req: any, res: any) {
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
     const result = await streamText({
-      // REVERTING TO THE ONLY MODEL THAT AUTHENTICATED SUCCESSFULLY
-      model: google('gemini-flash-latest'),
+      // 1. Use the working model alias
+      model: google('gemini-flash-latest', {
+        // 2. CRITICAL: Disable all safety filters so "Hydra" isn't blocked
+        safetySettings: [
+            { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+            { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+            { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+            { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+        ]
+      }),
       system: finalSystemPrompt,
       messages: messages.map((m: any) => ({
         role: m.role,
@@ -160,7 +162,6 @@ export default async function handler(req: any, res: any) {
             return await lookupProductInfo(String(q));
           },
         }),
-        // Re-adding Spoke Calc (It wasn't the cause of the 404/400 errors)
         calculate_spoke_lengths: tool({
           description: 'Calculates precise spoke lengths based on hub and rim geometry.',
           parameters: z.object({
@@ -196,7 +197,6 @@ export default async function handler(req: any, res: any) {
     let hasSentText = false;
 
     for await (const part of result.fullStream) {
-        // Robust Streaming Check
         const textContent = part.textDelta || part.text || part.content || "";
         if (part.type === 'text-delta' && typeof textContent === 'string' && textContent.length > 0) {
             res.write(textContent);
