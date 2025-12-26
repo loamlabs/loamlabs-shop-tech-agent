@@ -11,7 +11,7 @@ export const config = {
 };
 
 const STANDARD_SHOP_BUILD_DAYS = 5;
-const SEARCH_LIMIT = 20;
+const SEARCH_LIMIT = 50; // Increased to allow for heavy filtering
 
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
@@ -21,8 +21,8 @@ You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 - Identity: "LoamLabs Automated Lead Tech".
 
 **CRITICAL RULES:**
-1. **ALWAYS REPLY:** If a tool returns data, you **MUST** generate a text response summarizing it for the user. Do not stop.
-2. **SEARCH SIMPLY:** Use ONLY the core Brand or Model name (e.g. "Hydra").
+1. **RESPECT MODEL NUMBERS:** If the user types "Hydra2" or "Pro 5", search for exactly that. Do not simplify "Hydra2" to "Hydra".
+2. **ALWAYS REPLY:** If a tool returns data, you **MUST** generate a text response summarizing it for the user. Do not stop.
 3. **INVENTORY PRECISION:** Report specific variants that are in stock.
 4. **LEAD TIME:** In Stock = ~${STANDARD_SHOP_BUILD_DAYS} days. Out of Stock = Mfg Lead Time + ${STANDARD_SHOP_BUILD_DAYS} days.
 
@@ -30,9 +30,52 @@ You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 The user's current selections are injected below.
 `;
 
-// Pass 'isAdmin' into the helper to toggle debug info
-async function lookupProductInfo(query: string, isAdmin: boolean) {
+// Helper to filter results based on Build Context
+function filterProductsByContext(products: any[], context: any, query: string) {
+  return products.filter(p => {
+    const title = p.title.toLowerCase();
+    const tags = p.tags.map((t: string) => t.toLowerCase());
+    const queryLower = query.toLowerCase();
+
+    // 1. COMPONENT TYPE FILTER (Crucial for filtering out Wheelsets)
+    // If the query mentions "hub", ONLY show items tagged 'component:hub'
+    if (queryLower.includes('hub') && !tags.includes('component:hub')) return false;
+    if (queryLower.includes('rim') && !tags.includes('component:rim')) return false;
+
+    // 2. POSITION FILTER (Front vs Rear)
+    // We assume the context object has keys like 'position' or similar. 
+    // Adjust 'context.position' to match your actual object key if different.
+    if (context?.position) {
+        const pos = context.position.toLowerCase();
+        if (pos.includes('rear') && title.includes('front')) return false;
+        if (pos.includes('front') && title.includes('rear') && !title.includes('front/rear')) return false;
+    }
+
+    // 3. BRAKE INTERFACE FILTER
+    if (context?.brake_interface) {
+        const brake = context.brake_interface.toLowerCase();
+        if (brake.includes('centerlock') && title.includes('6-bolt')) return false;
+        if (brake.includes('6-bolt') && title.includes('centerlock')) return false;
+    }
+
+    // 4. AXLE STANDARD FILTER (Smart Text Matching)
+    // If context is "SuperBoost 157", we look for "157" in title
+    if (context?.axle_spacing) {
+        const axle = context.axle_spacing;
+        if (axle.includes('157') && !title.includes('157')) return false;
+        if (axle.includes('148') && !title.includes('148')) return false;
+        if (axle.includes('142') && !title.includes('142')) return false;
+        if (axle.includes('100') && !title.includes('100')) return false;
+        if (axle.includes('110') && !title.includes('110')) return false;
+    }
+
+    return true;
+  });
+}
+
+async function lookupProductInfo(query: string, context: any) {
   console.log(`[Tool] Searching Shopify for: "${query}"`);
+  
   try {
     const adminResponse = await fetch(`https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-04/graphql.json`, {
         method: 'POST',
@@ -47,6 +90,7 @@ async function lookupProductInfo(query: string, isAdmin: boolean) {
                   edges {
                     node {
                       title
+                      tags
                       totalInventory
                       leadTime: metafield(namespace: "custom", key: "lead_time_days") { value }
                       variants(first: 25) {
@@ -69,17 +113,25 @@ async function lookupProductInfo(query: string, isAdmin: boolean) {
     });
 
     const data = await adminResponse.json();
-    if (!data.data || !data.data.products) return "Search Error";
+    
+    if (!data.data || !data.data.products) {
+        return "Search failed. The store database returned an error.";
+    }
+    
+    let rawProducts = data.data.products.edges.map((e: any) => e.node);
+    console.log(`[Shopify] Raw Results: ${rawProducts.length}`);
 
-    const count = data.data.products.edges.length;
-    console.log(`[Shopify] Found ${count} products`);
+    // --- APPLY SMART FILTERS ---
+    const filteredProducts = filterProductsByContext(rawProducts, context, query);
+    console.log(`[Filter] Filtered down to: ${filteredProducts.length} items`);
 
-    if (count === 0) return "No products found matching that name.";
+    if (filteredProducts.length === 0) {
+        return `I found products matching "${query}", but none matched your specific build requirements (Axle/Brake/Position). Check your spelling or try a broader search.`;
+    }
 
     let totalPhysicalStock = 0;
 
-    const products = data.data.products.edges.map((e: any) => {
-      const p = e.node;
+    const formattedProducts = filteredProducts.map((p: any) => {
       const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 7;
       
       const inStockVariants = [];
@@ -96,33 +148,21 @@ async function lookupProductInfo(query: string, isAdmin: boolean) {
           }
       });
 
-      // MATH BREAKDOWN FOR ADMINS
-      const leadTimeDisplay = isAdmin 
-        ? `~${rawLeadTime + STANDARD_SHOP_BUILD_DAYS} days [${rawLeadTime} Mfg + ${STANDARD_SHOP_BUILD_DAYS} Shop]`
-        : `~${rawLeadTime + STANDARD_SHOP_BUILD_DAYS} days`;
-
       if (inStockVariants.length > 0) {
           return `• ${p.title} | IN STOCK: ${inStockVariants.join(', ')}`;
       } else if (specialOrderVariants.length > 0) {
-          return `• ${p.title} | NO STOCK (Special Order: ${leadTimeDisplay})`;
+          return `• ${p.title} | NO STOCK (Special Order Only: ~${rawLeadTime + STANDARD_SHOP_BUILD_DAYS} days)`;
       } else {
           return `• ${p.title} | Sold Out`;
       }
     });
 
-    const topResults = products.slice(0, 5);
+    const topResults = formattedProducts.slice(0, 5);
     
-    let output = "";
-    if (totalPhysicalStock === 0) {
-        output = `SUMMARY: Found ${count} matching products, but ZERO are physically in stock.\n` +
-                 `They are available for Special Order.\n\n` +
-                 `DETAILS:\n${topResults.join("\n")}`;
-    } else {
-        output = `SUMMARY: Found ${count} matching products. Some are IN STOCK.\n\n` +
-                 `DETAILS:\n${topResults.join("\n")}`;
-    }
-    
-    return output;
+    return `[DATA START]\n` + 
+           topResults.join("\n") + 
+           `\n[DATA END]\n\n` + 
+           `[SYSTEM COMMAND]: The user is waiting. Summarize these specific ${filteredProducts.length} options. If "NO STOCK", explicitly state "I don't have these in stock right now, but..."`;
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
@@ -146,14 +186,8 @@ export default async function handler(req: any, res: any) {
     let finalSystemPrompt = SYSTEM_PROMPT + `\n[CONTEXT]: ${JSON.stringify(buildContext?.components || {})}`;
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
-    // DEBUG: Log the user's build context so we can build filters later
-    if (buildContext) {
-        console.log("=== USER BUILD CONTEXT ===");
-        console.log(JSON.stringify(buildContext, null, 2));
-        console.log("==========================");
-    }
-
-    let capturedToolOutput = "";
+    // DEBUG CONTEXT
+    if (buildContext) console.log("[Context]", JSON.stringify(buildContext));
 
     const result = await streamText({
       model: google('gemini-flash-latest', {
@@ -172,9 +206,9 @@ export default async function handler(req: any, res: any) {
       maxSteps: 5,
       tools: {
         lookup_product_info: tool({
-          description: 'Searches the store inventory.',
+          description: 'Searches the store inventory for products.',
           parameters: z.object({ 
-            query: z.string().describe("Brand or Model name") 
+            query: z.string().describe("The exact Brand or Model name (e.g. 'Hydra2', 'Hope Pro 5').") 
           }),
           execute: async (args) => {
             console.log("[Tool Debug] Raw Args:", JSON.stringify(args));
@@ -182,11 +216,9 @@ export default async function handler(req: any, res: any) {
             if (!q || typeof q !== 'string') q = Object.values(args).join(" ");
             if (q) q = q.replace(/\b(stock|available|hub|hubs|pair|set|in)\b/gi, '').trim();
             if (!q) q = "undefined";
-
-            // Pass isAdmin to helper to show math
-            const info = await lookupProductInfo(String(q), isAdmin);
-            capturedToolOutput = info; 
-            return info;
+            
+            // PASS CONTEXT TO THE HELPER
+            return await lookupProductInfo(String(q), buildContext);
           },
         }),
       },
@@ -209,12 +241,7 @@ export default async function handler(req: any, res: any) {
     }
 
     if (!hasSentText) {
-      if (capturedToolOutput) {
-        console.log("AI was silent. Displaying structured data.");
-        res.write(capturedToolOutput);
-      } else {
-        res.write("I'm checking the shelves... can you try asking that one more time?");
-      }
+      res.write("...");
     }
 
     res.end();
