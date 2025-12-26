@@ -10,25 +10,33 @@ export const config = {
   runtime: 'nodejs',
 };
 
+const STANDARD_SHOP_BUILD_DAYS = 5;
 const SEARCH_LIMIT = 100;
 
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 
-**YOUR ROLE:**
-- You are a consultant, not a search engine.
-- You must understand the build before suggesting parts.
+**YOUR PERSONALITY:**
+- Professional, technical, direct, and "down to earth."
+- Identity: "LoamLabs Automated Lead Tech".
 
 **PROTOCOL:**
-1. **GATEKEEPING:** If a user asks for a component (e.g. "Hope hubs") but hasn't specified the **Position** (Front/Rear), you MUST ask for it before searching.
-2. **CLARIFY:** If the search results are "Special Order Only", clearly state that.
-3. **NO FLUFF:** Keep responses concise and technical.
+1. **ANALYZE:** Look at the user's query.
+2. **GATEKEEPING:** If the user asks for "Hubs" generally, ask "Front or Rear?" before searching.
+3. **SEARCH:** Use the tool.
+4. **REPORT:** 
+   - If the tool says "TOO MANY RESULTS", list the few examples provided but **immediately ask** clarifying questions (e.g. "I found 20 options. Do you need Boost or SuperBoost?").
+   - If "NO STOCK", be honest.
+
+**LEAD TIME RULES:** 
+- In Stock = "Ready to ship"
+- Special Order = Manufacturer Lead Time (e.g. "9 days").
 
 **CONTEXT:**
 The user's current selections are injected below.
 `;
 
-// Helper: Score products based on how many query keywords they match
+// Helper: Score products based on relevance
 function sortProductsByRelevance(products: any[], query: string) {
   const keywords = query.toLowerCase().split(' ').filter(k => k.length > 2); 
   
@@ -101,10 +109,12 @@ async function lookupProductInfo(query: string) {
     
     let rawProducts = data.data.products.edges.map((e: any) => e.node);
     
-    // Sort and Filter based on the FULL query (including Front/Rear)
+    // Sort and Filter
     const sortedProducts = sortProductsByRelevance(rawProducts, query);
     
-    if (sortedProducts.length === 0) return "No products found matching that description.";
+    if (sortedProducts.length === 0) return `No products found matching "${query}".`;
+
+    const totalMatches = sortedProducts.length;
 
     const products = sortedProducts.map((p: any) => {
       const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 7;
@@ -121,22 +131,29 @@ async function lookupProductInfo(query: string) {
           }
       });
 
-      // REMOVED SHOP BUILD TIME (+5) as requested
       if (inStockVariants.length > 0) {
           return `• ${p.title} | IN STOCK: ${inStockVariants.join(', ')}`;
       } else if (specialOrderVariants.length > 0) {
-          return `• ${p.title} | Special Order (Mfg Lead Time: ~${rawLeadTime} days)`;
+          return `• ${p.title} | Special Order (~${rawLeadTime} days)`;
       } else {
           return `• ${p.title} | Sold Out`;
       }
     });
 
+    // --- INTELLIGENT RESULT LIMITING ---
     const topResults = products.slice(0, 5);
     
+    let systemInstruction = `[SYSTEM COMMAND]: Summarize these options.`;
+    
+    // If too many results, FORCE the AI to ask clarifying questions
+    if (totalMatches > 6) {
+        systemInstruction = `[SYSTEM COMMAND]: Found ${totalMatches} items (Too many to list). Show the top 5 below, but then you MUST ask the user to clarify Axle Spacing (e.g. Boost) or Brake Style to narrow the list.`;
+    }
+
     return `[DATA START]\n` + 
            topResults.join("\n") + 
            `\n[DATA END]\n\n` + 
-           `[SYSTEM COMMAND]: Summarize these options. Be honest about stock levels.`;
+           systemInstruction;
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
@@ -160,9 +177,9 @@ export default async function handler(req: any, res: any) {
     let finalSystemPrompt = SYSTEM_PROMPT + `\n[CONTEXT]: ${JSON.stringify(buildContext?.components || {})}`;
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
-    // Variables for the Safety Net
-    let capturedToolOutput = "";
-    let toolActionTaken = "none"; // 'search', 'ask_clarification', 'none'
+    // Global variable to accumulate results from multiple tool calls (Front + Rear)
+    let allToolOutputs = [];
+    let toolActionTaken = "none";
 
     const result = await streamText({
       model: google('gemini-flash-latest', {
@@ -188,27 +205,34 @@ export default async function handler(req: any, res: any) {
           execute: async (args) => {
             console.log("[Tool Debug] Raw Args:", JSON.stringify(args));
             
-            // --- THE GATEKEEPER LOGIC ---
-            let q = args.query.toLowerCase();
-            if (!q || q === "undefined") q = Object.values(args).join(" ").toLowerCase();
+            // --- ROBUST ARGUMENT PARSING ---
+            // Grab ANY string value from args to avoid "undefined" errors
+            let q = "";
+            if (args.query) q = args.query;
+            else if (args.product_name) q = args.product_name; // Fix for "Hope Front Hub"
+            else q = Object.values(args).join(" ");
+            
+            q = String(q).trim();
+            const qLower = q.toLowerCase();
 
-            // 1. Is it a Hub query?
-            const isHubRequest = q.includes("hub");
-            // 2. Is Position missing?
-            const hasPosition = q.includes("front") || q.includes("rear") || q.includes("pair") || q.includes("set");
-            // 3. Is Context missing position?
+            // --- GATEKEEPER LOGIC ---
+            const isHubRequest = qLower.includes("hub");
+            const hasPosition = qLower.includes("front") || qLower.includes("rear") || qLower.includes("pair") || qLower.includes("set");
             const contextPosition = buildContext?.position;
 
             if (isHubRequest && !hasPosition && !contextPosition) {
                 console.log("[Tool] Intercepted Vague Query. Forcing Clarification.");
                 toolActionTaken = "ask_clarification";
-                return `[SYSTEM INSTRUCTION]: The user asked for "Hubs" but did not specify Front or Rear. STOP. Do not search. Ask the user: "Are you looking for a Front or Rear hub?"`;
+                return `[SYSTEM INSTRUCTION]: The user asked for "Hubs" but did not specify Front or Rear. STOP. Ask: "Are you looking for a Front or Rear hub?"`;
             }
 
-            // --- PROCEED TO SEARCH ---
+            // --- EXECUTE SEARCH ---
             toolActionTaken = "search";
-            const info = await lookupProductInfo(String(args.query));
-            capturedToolOutput = info; 
+            const info = await lookupProductInfo(q);
+            
+            // Append to global list (handles Front + Rear parallel calls)
+            allToolOutputs.push(info);
+            
             return info;
           },
         }),
@@ -231,15 +255,15 @@ export default async function handler(req: any, res: any) {
         }
     }
 
-    // --- INTELLIGENT FALLBACK ---
+    // --- SAFETY NET ---
     if (!hasSentText) {
       if (toolActionTaken === 'ask_clarification') {
-          // If the AI was told to ask but didn't, WE ask.
           res.write("I can check that for you. Are you looking for a Front or Rear hub?");
-      } else if (capturedToolOutput) {
-          // If the search ran but AI was silent, show data.
-          console.log("AI was silent. Using Data Safety Net.");
-          res.write(`I found these items:\n\n${capturedToolOutput.replace(/\[.*?\]/g, '')}`);
+      } else if (allToolOutputs.length > 0) {
+          // Join multiple results (e.g. Front Results + Rear Results)
+          const combinedOutput = allToolOutputs.join("\n\n---\n\n").replace(/\[.*?\]/g, '');
+          console.log("AI was silent. Using Accumulated Safety Net.");
+          res.write(`I found these items:\n\n${combinedOutput}`);
       } else {
           res.write("I'm checking the system... could you specify if you need a Front or Rear hub?");
       }
