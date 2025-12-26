@@ -10,7 +10,8 @@ export const config = {
   runtime: 'nodejs',
 };
 
-const SEARCH_LIMIT = 50; // Fetch more items so we can sort/filter them locally
+const STANDARD_SHOP_BUILD_DAYS = 5;
+const SEARCH_LIMIT = 100; // Increased to ensure we capture Front AND Rear variants
 
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
@@ -19,13 +20,16 @@ You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 - Professional, technical, direct, and "down to earth."
 - Identity: "LoamLabs Automated Lead Tech".
 
-**CRITICAL RULES:**
-1. **ALWAYS REPLY:** If a tool returns data, you **MUST** generate a text response summarizing it for the user. Do not stop.
-2. **SEARCH SMART:** If the user gives specs (e.g., "Hope 148"), include those specs in your tool query.
-3. **INVENTORY PRECISION:** Report specific variants that are in stock.
-4. **LEAD TIME:** 
-   - In Stock = "Ready to ship/build"
-   - Special Order = Manufacturer Lead Time (e.g., "9 days"). (Do NOT add shop build time).
+**PROTOCOL:**
+1. **ANALYZE:** Look at the user's query. Is it vague? (e.g. "Do you have Hope hubs?").
+2. **ASK:** If the user did NOT specify "Front" or "Rear", you MUST ask them to clarify before searching.
+   - *Example:* "I can check that. Are you looking for a Front or Rear hub?"
+3. **SEARCH:** Once you have the Position (Front/Rear), use the tool.
+4. **REPORT:** Summarize the results clearly.
+
+**LEAD TIME RULES:** 
+- In Stock = "Ready to ship"
+- Special Order = Manufacturer Lead Time (e.g. "9 days").
 
 **CONTEXT:**
 The user's current selections are injected below.
@@ -33,7 +37,7 @@ The user's current selections are injected below.
 
 // Helper: Score products based on how many query keywords they match
 function sortProductsByRelevance(products: any[], query: string) {
-  const keywords = query.toLowerCase().split(' ').filter(k => k.length > 2); // Ignore small words
+  const keywords = query.toLowerCase().split(' ').filter(k => k.length > 2); 
   
   return products.map(p => {
     let score = 0;
@@ -41,16 +45,16 @@ function sortProductsByRelevance(products: any[], query: string) {
     const tags = p.tags.join(' ').toLowerCase();
     
     // Exact Phrase Match Bonus
-    if (title.includes(query.toLowerCase())) score += 20;
+    if (title.includes(query.toLowerCase())) score += 50;
 
     // Keyword Match Points
     keywords.forEach(word => {
-      if (title.includes(word)) score += 5;
-      if (tags.includes(word)) score += 2;
+      if (title.includes(word)) score += 10;
+      if (tags.includes(word)) score += 5;
     });
 
     // Penalize Pre-Built Wheels if looking for Hubs
-    if (query.toLowerCase().includes('hub') && !tags.includes('component:hub')) score -= 50;
+    if (query.toLowerCase().includes('hub') && !tags.includes('component:hub')) score -= 100;
 
     return { product: p, score };
   })
@@ -61,6 +65,7 @@ function sortProductsByRelevance(products: any[], query: string) {
 async function lookupProductInfo(query: string) {
   console.log(`[Tool] Searching Shopify for: "${query}"`);
   try {
+    // 1. BROAD FETCH
     const adminResponse = await fetch(`https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-04/graphql.json`, {
         method: 'POST',
         headers: {
@@ -92,24 +97,32 @@ async function lookupProductInfo(query: string) {
                 }
               }
             `,
-            variables: { query: query.split(" ")[0] } // Search Broad (Brand only) first, then filter locally
+            // Search only the first word (e.g. "Hope") to get maximum candidates, then filter locally
+            variables: { query: query.split(" ")[0] } 
         })
     });
 
     const data = await adminResponse.json();
     
     if (!data.data || !data.data.products) {
-        return "Search failed. The store database returned an error.";
+        return { 
+            cleanOutput: "Search failed. Store database error.", 
+            aiPayload: "System Error: Shopify API failed." 
+        };
     }
     
     let rawProducts = data.data.products.edges.map((e: any) => e.node);
     console.log(`[Shopify] Broad Search Found: ${rawProducts.length} items`);
 
-    // --- APPLY INTELLIGENT SORTING ---
-    // This moves "Rear" or "148" items to the top if the user asked for them
+    // 2. INTELLIGENT SORT & FILTER
     const sortedProducts = sortProductsByRelevance(rawProducts, query);
     
-    if (sortedProducts.length === 0) return "No products found matching that query.";
+    if (sortedProducts.length === 0) {
+        return {
+            cleanOutput: "No products found matching that query.",
+            aiPayload: "Tool Result: 0 matches found."
+        };
+    }
 
     const products = sortedProducts.map((p: any) => {
       const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 7;
@@ -129,24 +142,25 @@ async function lookupProductInfo(query: string) {
       if (inStockVariants.length > 0) {
           return `• ${p.title} | IN STOCK: ${inStockVariants.join(', ')}`;
       } else if (specialOrderVariants.length > 0) {
-          // REMOVED THE +5 DAYS
           return `• ${p.title} | Special Order (~${rawLeadTime} days)`;
       } else {
           return `• ${p.title} | Sold Out`;
       }
     });
 
-    const topResults = products.slice(0, 5);
+    const topResults = products.slice(0, 5); // Still limit output for readability
     console.log(`[Tool] Returning top 5 sorted results.`);
     
-    return `[DATA START]\n` + 
-           topResults.join("\n") + 
-           `\n[DATA END]\n\n` + 
-           `[SYSTEM COMMAND]: Summarize the stock status of these specific items for the user.`;
+    const cleanOutput = topResults.join("\n");
+    
+    return {
+        cleanOutput: cleanOutput,
+        aiPayload: `[DATA START]\n${cleanOutput}\n[DATA END]\n\n[SYSTEM COMMAND]: The user is waiting. Summarize these specific items for the user.`
+    };
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
-    return "Error connecting to product database.";
+    return { cleanOutput: "Error connecting to database.", aiPayload: "Error." };
   }
 }
 
@@ -166,6 +180,7 @@ export default async function handler(req: any, res: any) {
     let finalSystemPrompt = SYSTEM_PROMPT + `\n[CONTEXT]: ${JSON.stringify(buildContext?.components || {})}`;
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
+    // Store the CLEAN output here for fallback
     let capturedToolOutput = "";
 
     const result = await streamText({
@@ -193,12 +208,16 @@ export default async function handler(req: any, res: any) {
             console.log("[Tool Debug] Raw Args:", JSON.stringify(args));
             let q = args.query;
             if (!q || typeof q !== 'string') q = Object.values(args).join(" ");
-            if (q) q = q.replace(/\b(stock|available|pair|set|in)\b/gi, '').trim(); // Keep 'hub' for scoring
+            if (q) q = q.replace(/\b(stock|available|pair|set|in)\b/gi, '').trim(); 
             if (!q) q = "undefined";
             
-            const info = await lookupProductInfo(String(q));
-            capturedToolOutput = info; 
-            return info;
+            const resultObj = await lookupProductInfo(String(q));
+            
+            // Capture the CLEAN text for the fallback
+            capturedToolOutput = resultObj.cleanOutput; 
+            
+            // Return the INSTRUCTIVE text to the AI
+            return resultObj.aiPayload;
           },
         }),
       },
@@ -213,7 +232,6 @@ export default async function handler(req: any, res: any) {
     let hasSentText = false;
 
     for await (const part of result.fullStream) {
-        // VERBOSE LOGGING RESTORED
         if (part.type !== 'text-delta') console.log("Stream Part:", part.type);
 
         const textContent = part.textDelta || part.text || part.content || "";
@@ -223,12 +241,13 @@ export default async function handler(req: any, res: any) {
         }
     }
 
+    // CLEAN SAFETY NET
     if (!hasSentText) {
       if (capturedToolOutput) {
-        console.log("AI was silent. Using Safety Net with Sorted Results.");
-        res.write(capturedToolOutput.replace(/\[.*?\]/g, '')); // Clean system tags
+        console.log("AI was silent. Using Clean Safety Net.");
+        res.write(`I found these items:\n\n${capturedToolOutput}`);
       } else {
-        res.write("I'm having trouble connecting to the inventory system. Please try again.");
+        res.write("I need a bit more detail. Are you looking for Front or Rear hubs?");
       }
     }
 
