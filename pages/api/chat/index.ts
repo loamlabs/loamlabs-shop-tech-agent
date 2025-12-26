@@ -98,7 +98,15 @@ async function lookupProductInfo(query: string) {
     const limitedProducts = products.slice(0, 5);
     console.log(`[Tool] Returning top ${limitedProducts.length} results to AI.`);
     
-    return `FOUND ${count} ITEMS. TOP 5:\n` + limitedProducts.join("\n");
+    // VENTRILOQUIST TRICK: Return the data as if the User is speaking it.
+    // This forces the AI to reply to the "User".
+    return `
+    [SYSTEM DATA START]
+    ${limitedProducts.join("\n")}
+    [SYSTEM DATA END]
+    
+    [USER]: "Okay, I see the data above. Please summarize which specific variants are in stock for me."
+    `;
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
@@ -123,8 +131,9 @@ export default async function handler(req: any, res: any) {
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
     const result = await streamText({
-      // 1. USE GEMINI 2.0 (Smartest)
-      model: google('gemini-2.0-flash-exp', {
+      // 1. USE THE ONLY WORKING MODEL
+      model: google('gemini-flash-latest', {
+        // 2. DISABLE SAFETY TO PREVENT 'HYDRA' BLOCKING
         safetySettings: [
             { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
             { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
@@ -138,19 +147,22 @@ export default async function handler(req: any, res: any) {
         content: m.content
       })),
       maxSteps: 5,
-      // 2. SIMPLIFIED SCHEMA to prevent 400 Errors
       tools: {
         lookup_product_info: tool({
-          description: 'Searches for products in the store.',
+          description: 'Searches the store inventory for products.',
           parameters: z.object({ 
-            query: z.string().describe("The search term (Brand or Model)"),
+            query: z.string().describe("The core Brand or Model name to search for (e.g. 'Hydra').") 
           }),
           execute: async (args) => {
             console.log("[Tool Debug] Raw Args:", JSON.stringify(args));
-            let q = args.query || Object.values(args)[0] || "undefined";
-            if (typeof q === 'string') {
-               q = q.replace(/\b(stock|available|hub|hubs|pair|set|in)\b/gi, '').trim();
+            let q = args.query;
+            if (!q || typeof q !== 'string') {
+                q = Object.values(args).filter(v => v && typeof v === 'string' && v.trim().length > 0).join(" ");
             }
+            if (q) {
+                q = q.replace(/\b(stock|available|hub|hubs|pair|set|in)\b/gi, '').trim();
+            }
+            if (!q) q = "undefined";
             return await lookupProductInfo(String(q));
           },
         }),
