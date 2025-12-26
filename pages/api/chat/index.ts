@@ -21,17 +21,17 @@ You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 - Identity: "LoamLabs Automated Lead Tech".
 
 **CRITICAL RULES:**
-1. **BE HONEST:** If the tool says "NO PHYSICAL STOCK", you MUST start your reply with "No, I don't have those in stock right now." then explain they are available for special order.
-2. **BE CONCISE:** Do not list 20 variants if none are in stock. Just say "We can special order any configuration you need."
-3. **LEAD TIMES:** 
-   - In Stock = Ready to build (~${STANDARD_SHOP_BUILD_DAYS} days).
-   - Special Order = Manufacturer Lead Time + ${STANDARD_SHOP_BUILD_DAYS} days.
+1. **ALWAYS REPLY:** If a tool returns data, you **MUST** generate a text response summarizing it for the user. Do not stop.
+2. **SEARCH SIMPLY:** Use ONLY the core Brand or Model name (e.g. "Hydra").
+3. **INVENTORY PRECISION:** Report specific variants that are in stock.
+4. **LEAD TIME:** In Stock = ~${STANDARD_SHOP_BUILD_DAYS} days. Out of Stock = Mfg Lead Time + ${STANDARD_SHOP_BUILD_DAYS} days.
 
 **CONTEXT:**
 The user's current selections are injected below.
 `;
 
-async function lookupProductInfo(query: string) {
+// Pass 'isAdmin' into the helper to toggle debug info
+async function lookupProductInfo(query: string, isAdmin: boolean) {
   console.log(`[Tool] Searching Shopify for: "${query}"`);
   try {
     const adminResponse = await fetch(`https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-04/graphql.json`, {
@@ -80,7 +80,7 @@ async function lookupProductInfo(query: string) {
 
     const products = data.data.products.edges.map((e: any) => {
       const p = e.node;
-      const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 7; // Default 7 days if missing
+      const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 7;
       
       const inStockVariants = [];
       const specialOrderVariants = [];
@@ -88,7 +88,6 @@ async function lookupProductInfo(query: string) {
       p.variants.edges.forEach((v: any) => {
           const node = v.node;
           const name = node.title.replace('Default Title', 'Standard');
-          
           if (node.inventoryQuantity > 0) {
               inStockVariants.push(`${name} (Qty: ${node.inventoryQuantity})`);
               totalPhysicalStock += node.inventoryQuantity;
@@ -97,11 +96,15 @@ async function lookupProductInfo(query: string) {
           }
       });
 
-      // LOGIC: If nothing is physically in stock, don't list every single variant.
+      // MATH BREAKDOWN FOR ADMINS
+      const leadTimeDisplay = isAdmin 
+        ? `~${rawLeadTime + STANDARD_SHOP_BUILD_DAYS} days [${rawLeadTime} Mfg + ${STANDARD_SHOP_BUILD_DAYS} Shop]`
+        : `~${rawLeadTime + STANDARD_SHOP_BUILD_DAYS} days`;
+
       if (inStockVariants.length > 0) {
           return `• ${p.title} | IN STOCK: ${inStockVariants.join(', ')}`;
       } else if (specialOrderVariants.length > 0) {
-          return `• ${p.title} | NO STOCK (Special Order Only: ~${rawLeadTime + STANDARD_SHOP_BUILD_DAYS} days)`;
+          return `• ${p.title} | NO STOCK (Special Order: ${leadTimeDisplay})`;
       } else {
           return `• ${p.title} | Sold Out`;
       }
@@ -109,7 +112,6 @@ async function lookupProductInfo(query: string) {
 
     const topResults = products.slice(0, 5);
     
-    // CAPTURE OUTPUT WITH INTELLIGENT SUMMARY
     let output = "";
     if (totalPhysicalStock === 0) {
         output = `SUMMARY: Found ${count} matching products, but ZERO are physically in stock.\n` +
@@ -144,7 +146,13 @@ export default async function handler(req: any, res: any) {
     let finalSystemPrompt = SYSTEM_PROMPT + `\n[CONTEXT]: ${JSON.stringify(buildContext?.components || {})}`;
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
-    // We store the tool result here for the fallback mechanism
+    // DEBUG: Log the user's build context so we can build filters later
+    if (buildContext) {
+        console.log("=== USER BUILD CONTEXT ===");
+        console.log(JSON.stringify(buildContext, null, 2));
+        console.log("==========================");
+    }
+
     let capturedToolOutput = "";
 
     const result = await streamText({
@@ -175,8 +183,9 @@ export default async function handler(req: any, res: any) {
             if (q) q = q.replace(/\b(stock|available|hub|hubs|pair|set|in)\b/gi, '').trim();
             if (!q) q = "undefined";
 
-            const info = await lookupProductInfo(String(q));
-            capturedToolOutput = info; // Save for fallback
+            // Pass isAdmin to helper to show math
+            const info = await lookupProductInfo(String(q), isAdmin);
+            capturedToolOutput = info; 
             return info;
           },
         }),
@@ -199,8 +208,6 @@ export default async function handler(req: any, res: any) {
         }
     }
 
-    // INTELLIGENT FALLBACK
-    // If the AI is silent, we display the data ourselves, but clearer now.
     if (!hasSentText) {
       if (capturedToolOutput) {
         console.log("AI was silent. Displaying structured data.");
