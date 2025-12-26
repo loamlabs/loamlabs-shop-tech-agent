@@ -105,10 +105,10 @@ async function lookupProductInfo(query: string) {
     const limitedProducts = products.slice(0, 5);
     console.log(`[Tool] Returning top ${limitedProducts.length} results to AI.`);
     
-    // Simplified return string to avoid triggering stop sequences
-    return `Found ${count} matches. Here are the top 5:\n` + 
+    // Explicit Instruction Payload
+    return `[SYSTEM DATA]: Found ${count} matches. Top 5 listed below.\n` + 
            limitedProducts.join("\n") + 
-           `\n\nSYSTEM INSTRUCTION: Summarize these options for the user now.`;
+           `\n\n[INSTRUCTION]: Summarize these options for the user now. Do not be silent.`;
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
@@ -133,8 +133,8 @@ export default async function handler(req: any, res: any) {
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
     const result = await streamText({
-      // Explicitly using Gemini 1.5 Pro
-      model: google('gemini-1.5-pro', {
+      // SWITCHING TO GEMINI 2.0 FLASH (Confirmed Available & Smarter)
+      model: google('gemini-2.0-flash-001', {
         safetySettings: [
           { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
           { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
@@ -157,7 +157,6 @@ export default async function handler(req: any, res: any) {
           }),
           execute: async (args) => {
             console.log("[Tool Debug] Raw Args:", JSON.stringify(args));
-            
             let q = args.query;
             if (!q || typeof q !== 'string') {
                 q = Object.values(args)
@@ -168,7 +167,6 @@ export default async function handler(req: any, res: any) {
                 q = q.replace(/\b(stock|available|hub|hubs|pair|set|in)\b/gi, '').trim();
             }
             if (!q) q = "undefined";
-            
             return await lookupProductInfo(String(q));
           },
         }),
