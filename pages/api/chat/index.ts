@@ -20,16 +20,112 @@ You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 - Professional, technical, direct, and "down to earth."
 - Identity: "LoamLabs Automated Lead Tech".
 
-**GUIDANCE:**
-1. **Search Simply:** Use core brand/model names (e.g. "Hydra", "Hope").
-2. **Be Helpful:** If you find products, list the in-stock options clearly.
-3. **Don't Give Up:** If you find products, YOU MUST TELL THE USER about them.
+**CRITICAL RULES:**
+1. **BE HONEST:** If the tool says "NO PHYSICAL STOCK", you MUST start your reply with "No, I don't have those in stock right now." then explain they are available for special order.
+2. **BE CONCISE:** Do not list 20 variants if none are in stock. Just say "We can special order any configuration you need."
+3. **LEAD TIMES:** 
+   - In Stock = Ready to build (~${STANDARD_SHOP_BUILD_DAYS} days).
+   - Special Order = Manufacturer Lead Time + ${STANDARD_SHOP_BUILD_DAYS} days.
+
+**CONTEXT:**
+The user's current selections are injected below.
 `;
 
-// Helper to format the list cleanly
-function formatProductList(products) {
-  if (products.length === 0) return "No matching products found.";
-  return products.join("\n");
+async function lookupProductInfo(query: string) {
+  console.log(`[Tool] Searching Shopify for: "${query}"`);
+  try {
+    const adminResponse = await fetch(`https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-04/graphql.json`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN || ''
+        },
+        body: JSON.stringify({
+            query: `
+              query searchProducts($query: String!) {
+                products(first: ${SEARCH_LIMIT}, query: $query) {
+                  edges {
+                    node {
+                      title
+                      totalInventory
+                      leadTime: metafield(namespace: "custom", key: "lead_time_days") { value }
+                      variants(first: 25) {
+                        edges {
+                          node {
+                            title
+                            inventoryPolicy
+                            inventoryQuantity
+                            selectedOptions { name value }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `,
+            variables: { query }
+        })
+    });
+
+    const data = await adminResponse.json();
+    if (!data.data || !data.data.products) return "Search Error";
+
+    const count = data.data.products.edges.length;
+    console.log(`[Shopify] Found ${count} products`);
+
+    if (count === 0) return "No products found matching that name.";
+
+    let totalPhysicalStock = 0;
+
+    const products = data.data.products.edges.map((e: any) => {
+      const p = e.node;
+      const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 7; // Default 7 days if missing
+      
+      const inStockVariants = [];
+      const specialOrderVariants = [];
+
+      p.variants.edges.forEach((v: any) => {
+          const node = v.node;
+          const name = node.title.replace('Default Title', 'Standard');
+          
+          if (node.inventoryQuantity > 0) {
+              inStockVariants.push(`${name} (Qty: ${node.inventoryQuantity})`);
+              totalPhysicalStock += node.inventoryQuantity;
+          } else if (node.inventoryPolicy === 'CONTINUE') {
+              specialOrderVariants.push(name);
+          }
+      });
+
+      // LOGIC: If nothing is physically in stock, don't list every single variant.
+      if (inStockVariants.length > 0) {
+          return `• ${p.title} | IN STOCK: ${inStockVariants.join(', ')}`;
+      } else if (specialOrderVariants.length > 0) {
+          return `• ${p.title} | NO STOCK (Special Order Only: ~${rawLeadTime + STANDARD_SHOP_BUILD_DAYS} days)`;
+      } else {
+          return `• ${p.title} | Sold Out`;
+      }
+    });
+
+    const topResults = products.slice(0, 5);
+    
+    // CAPTURE OUTPUT WITH INTELLIGENT SUMMARY
+    let output = "";
+    if (totalPhysicalStock === 0) {
+        output = `SUMMARY: Found ${count} matching products, but ZERO are physically in stock.\n` +
+                 `They are available for Special Order.\n\n` +
+                 `DETAILS:\n${topResults.join("\n")}`;
+    } else {
+        output = `SUMMARY: Found ${count} matching products. Some are IN STOCK.\n\n` +
+                 `DETAILS:\n${topResults.join("\n")}`;
+    }
+    
+    return output;
+
+  } catch (error) {
+    console.error("Shopify Lookup Error:", error);
+    return "Error connecting to product database.";
+  }
 }
 
 export default async function handler(req: any, res: any) {
@@ -48,8 +144,7 @@ export default async function handler(req: any, res: any) {
     let finalSystemPrompt = SYSTEM_PROMPT + `\n[CONTEXT]: ${JSON.stringify(buildContext?.components || {})}`;
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
-    // --- SAFETY NET VARIABLE ---
-    // We will store the search results here. If the AI is silent, we print this.
+    // We store the tool result here for the fallback mechanism
     let capturedToolOutput = "";
 
     const result = await streamText({
@@ -71,82 +166,18 @@ export default async function handler(req: any, res: any) {
         lookup_product_info: tool({
           description: 'Searches the store inventory.',
           parameters: z.object({ 
-            query: z.string().describe("Brand or Model name (e.g. 'Hydra')") 
+            query: z.string().describe("Brand or Model name") 
           }),
           execute: async (args) => {
             console.log("[Tool Debug] Raw Args:", JSON.stringify(args));
-            
-            // Clean Query
             let q = args.query;
             if (!q || typeof q !== 'string') q = Object.values(args).join(" ");
             if (q) q = q.replace(/\b(stock|available|hub|hubs|pair|set|in)\b/gi, '').trim();
             if (!q) q = "undefined";
 
-            console.log(`[Tool] Searching Shopify for: "${q}"`);
-
-            // --- SHOPIFY FETCH ---
-            const adminResponse = await fetch(`https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-04/graphql.json`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN || ''
-                },
-                body: JSON.stringify({
-                    query: `
-                      query searchProducts($query: String!) {
-                        products(first: ${SEARCH_LIMIT}, query: $query) {
-                          edges {
-                            node {
-                              title
-                              totalInventory
-                              leadTime: metafield(namespace: "custom", key: "lead_time_days") { value }
-                              variants(first: 25) {
-                                edges {
-                                  node {
-                                    title
-                                    inventoryPolicy
-                                    inventoryQuantity
-                                    selectedOptions { name value }
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    `,
-                    variables: { query: q }
-                })
-            });
-
-            const data = await adminResponse.json();
-            if (!data.data || !data.data.products) return "Search Error";
-
-            const count = data.data.products.edges.length;
-            console.log(`[Shopify] Found ${count} products`);
-
-            const products = data.data.products.edges.map((e: any) => {
-              const p = e.node;
-              const inStockVariants = [];
-              p.variants.edges.forEach((v: any) => {
-                  const node = v.node;
-                  const name = node.title.replace('Default Title', 'Standard');
-                  if (node.inventoryQuantity > 0 || node.inventoryPolicy === 'CONTINUE') {
-                      const qtyMsg = node.inventoryQuantity > 0 ? `Qty: ${node.inventoryQuantity}` : "Made to Order";
-                      inStockVariants.push(`${name} (${qtyMsg})`);
-                  }
-              });
-              let stockSummary = "Special Order Only";
-              if (inStockVariants.length > 0) stockSummary = `In Stock: ${inStockVariants.join(', ')}`;
-              return `• ${p.title} | ${stockSummary}`;
-            });
-
-            const top5 = products.slice(0, 5);
-            
-            // --- CAPTURE FOR FALLBACK ---
-            capturedToolOutput = `I found ${count} matching items. Here are the top results:\n\n${top5.join("\n")}`;
-            
-            return capturedToolOutput;
+            const info = await lookupProductInfo(String(q));
+            capturedToolOutput = info; // Save for fallback
+            return info;
           },
         }),
       },
@@ -168,15 +199,14 @@ export default async function handler(req: any, res: any) {
         }
     }
 
-    // --- THE SAFETY NET ---
-    // If the AI stayed silent, BUT we have search results, send them directly.
+    // INTELLIGENT FALLBACK
+    // If the AI is silent, we display the data ourselves, but clearer now.
     if (!hasSentText) {
       if (capturedToolOutput) {
-        console.log("AI was silent. Sending captured tool output as fallback.");
+        console.log("AI was silent. Displaying structured data.");
         res.write(capturedToolOutput);
       } else {
-        console.log("AI was silent and no tool output. Sending generic fallback.");
-        res.write("I searched for that, but I'm having trouble retrieving the list right now. Please try again.");
+        res.write("I'm checking the shelves... can you try asking that one more time?");
       }
     }
 
