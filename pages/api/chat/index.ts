@@ -10,43 +10,55 @@ export const config = {
   runtime: 'nodejs',
 };
 
-const SEARCH_LIMIT = 100; // Need a large pool to filter correctly
+const SEARCH_LIMIT = 100;
 
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 
-**YOUR PERSONALITY:**
-- Professional, technical, direct, and "down to earth."
-- Identity: "LoamLabs Automated Lead Tech".
+**YOUR ROLE:**
+- You are a consultant, not a search engine.
+- You must understand the build before suggesting parts.
 
 **PROTOCOL:**
-1. **ANALYZE:** Look at the user's query.
-2. **SEARCH:** Use the tool to check stock.
-3. **REPORT:** Summarize the results. If you found both Front and Rear options, mention both.
-
-**LEAD TIME RULES:** 
-- In Stock = "Ready to ship"
-- Special Order = Manufacturer Lead Time (e.g. "9 days").
+1. **GATEKEEPING:** If a user asks for a component (e.g. "Hope hubs") but hasn't specified the **Position** (Front/Rear), you MUST ask for it before searching.
+2. **CLARIFY:** If the search results are "Special Order Only", clearly state that.
+3. **NO FLUFF:** Keep responses concise and technical.
 
 **CONTEXT:**
 The user's current selections are injected below.
 `;
 
-async function lookupProductInfo(query: string, rawOriginalQuery: string) {
-  // 1. DETECT INTENT
-  const lowerQ = rawOriginalQuery.toLowerCase();
-  const wantsFront = lowerQ.includes('front');
-  const wantsRear = lowerQ.includes('rear');
-  const wantsHub = lowerQ.includes('hub');
+// Helper: Score products based on how many query keywords they match
+function sortProductsByRelevance(products: any[], query: string) {
+  const keywords = query.toLowerCase().split(' ').filter(k => k.length > 2); 
   
-  // Default to "Both" if neither is specified
-  const showFront = wantsFront || !wantsRear;
-  const showRear = wantsRear || !wantsFront;
+  return products.map(p => {
+    let score = 0;
+    const title = p.title.toLowerCase();
+    const tags = p.tags.join(' ').toLowerCase();
+    
+    // Strict Filter: If keyword is "Rear", title MUST have "Rear"
+    if (keywords.includes('rear') && !title.includes('rear')) return { product: p, score: -999 };
+    if (keywords.includes('front') && !title.includes('front')) return { product: p, score: -999 };
 
-  // 2. CLEAN QUERY (Strip Position words to find the Brand)
+    if (title.includes(query.toLowerCase())) score += 50;
+    keywords.forEach(word => {
+      if (title.includes(word)) score += 10;
+      if (tags.includes(word)) score += 5;
+    });
+    if (query.toLowerCase().includes('hub') && !tags.includes('component:hub')) score -= 100;
+
+    return { product: p, score };
+  })
+  .filter(item => item.score > -100)
+  .sort((a, b) => b.score - a.score)
+  .map(item => item.product);
+}
+
+async function lookupProductInfo(query: string) {
+  // CLEAN THE QUERY
   const cleanQuery = query.replace(/\b(front|rear|hub|hubs|wheel|wheels|set|pair|stock|available|in|and)\b/gi, '').trim();
-  
-  console.log(`[Tool] Searching for Brand/Model: "${cleanQuery}" (Intent: F=${showFront}, R=${showRear})`);
+  console.log(`[Tool] Searching Shopify for Brand: "${cleanQuery}" (Context: "${query}")`);
   
   try {
     const adminResponse = await fetch(`https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-04/graphql.json`, {
@@ -89,34 +101,12 @@ async function lookupProductInfo(query: string, rawOriginalQuery: string) {
     
     let rawProducts = data.data.products.edges.map((e: any) => e.node);
     
-    // 3. STRICT FILTERING
-    const filtered = rawProducts.filter((p: any) => {
-        const title = p.title.toLowerCase();
-        const tags = p.tags.map(t => t.toLowerCase());
+    // Sort and Filter based on the FULL query (including Front/Rear)
+    const sortedProducts = sortProductsByRelevance(rawProducts, query);
+    
+    if (sortedProducts.length === 0) return "No products found matching that description.";
 
-        // A. Wheelset Filter: If user wants "Hub", discard non-hubs
-        if (wantsHub && !tags.includes('component:hub')) return false;
-
-        // B. Brand Match: Title must contain the search term (e.g. "Hope")
-        if (!title.includes(cleanQuery.toLowerCase())) return false;
-
-        return true;
-    });
-
-    // 4. SEPARATE INTO BUCKETS
-    const frontItems = filtered.filter(p => p.title.toLowerCase().includes('front'));
-    const rearItems = filtered.filter(p => p.title.toLowerCase().includes('rear'));
-
-    // 5. BUILD THE RESULT LIST
-    let finalSelection = [];
-
-    if (showFront) finalSelection.push(...frontItems.slice(0, 4)); // Take top 4 Fronts
-    if (showRear) finalSelection.push(...rearItems.slice(0, 4));   // Take top 4 Rears
-
-    if (finalSelection.length === 0) return "No products found matching those specs.";
-
-    // 6. FORMAT OUTPUT
-    const formatted = finalSelection.map((p: any) => {
+    const products = sortedProducts.map((p: any) => {
       const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 7;
       const inStockVariants = [];
       const specialOrderVariants = [];
@@ -131,17 +121,22 @@ async function lookupProductInfo(query: string, rawOriginalQuery: string) {
           }
       });
 
+      // REMOVED SHOP BUILD TIME (+5) as requested
       if (inStockVariants.length > 0) {
           return `• ${p.title} | IN STOCK: ${inStockVariants.join(', ')}`;
       } else if (specialOrderVariants.length > 0) {
-          // NO EXTRA 5 DAYS ADDED
-          return `• ${p.title} | Special Order (~${rawLeadTime} days)`;
+          return `• ${p.title} | Special Order (Mfg Lead Time: ~${rawLeadTime} days)`;
       } else {
           return `• ${p.title} | Sold Out`;
       }
     });
 
-    return formatted.join("\n");
+    const topResults = products.slice(0, 5);
+    
+    return `[DATA START]\n` + 
+           topResults.join("\n") + 
+           `\n[DATA END]\n\n` + 
+           `[SYSTEM COMMAND]: Summarize these options. Be honest about stock levels.`;
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
@@ -165,7 +160,9 @@ export default async function handler(req: any, res: any) {
     let finalSystemPrompt = SYSTEM_PROMPT + `\n[CONTEXT]: ${JSON.stringify(buildContext?.components || {})}`;
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
+    // Variables for the Safety Net
     let capturedToolOutput = "";
+    let toolActionTaken = "none"; // 'search', 'ask_clarification', 'none'
 
     const result = await streamText({
       model: google('gemini-flash-latest', {
@@ -190,11 +187,27 @@ export default async function handler(req: any, res: any) {
           }),
           execute: async (args) => {
             console.log("[Tool Debug] Raw Args:", JSON.stringify(args));
-            let q = args.query;
-            if (!q || typeof q !== 'string') q = Object.values(args).join(" ");
             
-            // Pass the RAW ORIGINAL query to the helper so we can detect "Front" and "Rear"
-            const info = await lookupProductInfo(String(q), String(q));
+            // --- THE GATEKEEPER LOGIC ---
+            let q = args.query.toLowerCase();
+            if (!q || q === "undefined") q = Object.values(args).join(" ").toLowerCase();
+
+            // 1. Is it a Hub query?
+            const isHubRequest = q.includes("hub");
+            // 2. Is Position missing?
+            const hasPosition = q.includes("front") || q.includes("rear") || q.includes("pair") || q.includes("set");
+            // 3. Is Context missing position?
+            const contextPosition = buildContext?.position;
+
+            if (isHubRequest && !hasPosition && !contextPosition) {
+                console.log("[Tool] Intercepted Vague Query. Forcing Clarification.");
+                toolActionTaken = "ask_clarification";
+                return `[SYSTEM INSTRUCTION]: The user asked for "Hubs" but did not specify Front or Rear. STOP. Do not search. Ask the user: "Are you looking for a Front or Rear hub?"`;
+            }
+
+            // --- PROCEED TO SEARCH ---
+            toolActionTaken = "search";
+            const info = await lookupProductInfo(String(args.query));
             capturedToolOutput = info; 
             return info;
           },
@@ -218,12 +231,17 @@ export default async function handler(req: any, res: any) {
         }
     }
 
+    // --- INTELLIGENT FALLBACK ---
     if (!hasSentText) {
-      if (capturedToolOutput) {
-        console.log("AI was silent. Using Safety Net.");
-        res.write(`I found these items:\n\n${capturedToolOutput}`);
+      if (toolActionTaken === 'ask_clarification') {
+          // If the AI was told to ask but didn't, WE ask.
+          res.write("I can check that for you. Are you looking for a Front or Rear hub?");
+      } else if (capturedToolOutput) {
+          // If the search ran but AI was silent, show data.
+          console.log("AI was silent. Using Data Safety Net.");
+          res.write(`I found these items:\n\n${capturedToolOutput.replace(/\[.*?\]/g, '')}`);
       } else {
-        res.write("I need a bit more detail. Are you looking for Front or Rear hubs?");
+          res.write("I'm checking the system... could you specify if you need a Front or Rear hub?");
       }
     }
 
