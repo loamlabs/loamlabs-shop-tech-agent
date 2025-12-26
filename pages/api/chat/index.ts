@@ -90,7 +90,6 @@ async function lookupProductInfo(query: string) {
       p.variants.edges.forEach((v: any) => {
           const node = v.node;
           const name = node.title.replace('Default Title', 'Standard');
-          // Intelligent Stock Check
           if (node.inventoryQuantity > 0 || node.inventoryPolicy === 'CONTINUE') {
               const qtyMsg = node.inventoryQuantity > 0 ? `Qty: ${node.inventoryQuantity}` : "Made to Order";
               inStockVariants.push(`${name} (${qtyMsg})`);
@@ -106,10 +105,10 @@ async function lookupProductInfo(query: string) {
     const limitedProducts = products.slice(0, 5);
     console.log(`[Tool] Returning top ${limitedProducts.length} results to AI.`);
     
-    // Strong Prompt Injection to force the AI to speak
-    return `[SYSTEM DATA]: Found ${count} matches. Top 5 listed below.\n` + 
+    // Simplified return string to avoid triggering stop sequences
+    return `Found ${count} matches. Here are the top 5:\n` + 
            limitedProducts.join("\n") + 
-           `\n\n[INSTRUCTION]: You must now summarize these specific options for the user. Do not stop.`;
+           `\n\nSYSTEM INSTRUCTION: Summarize these options for the user now.`;
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
@@ -134,15 +133,22 @@ export default async function handler(req: any, res: any) {
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
     const result = await streamText({
-      // SWITCHED TO PRO for better reasoning and tool follow-through
-      model: google('gemini-pro-latest'),
+      // Explicitly using Gemini 1.5 Pro
+      model: google('gemini-1.5-pro', {
+        safetySettings: [
+          { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+          { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+          { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+          { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+        ],
+      }),
       system: finalSystemPrompt,
       messages: messages.map((m: any) => ({
         role: m.role,
         content: m.content
       })),
       maxSteps: 5,
-      toolChoice: 'auto', // Explicitly allow tools
+      toolChoice: 'auto', 
       tools: {
         lookup_product_info: tool({
           description: 'Searches the store inventory for products.',
