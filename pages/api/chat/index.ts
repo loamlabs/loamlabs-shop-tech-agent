@@ -16,17 +16,17 @@ const SEARCH_LIMIT = 100;
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 
-**TONE & STYLE:**
-- Direct, technical, and concise.
-- **NO SIGN-OFFS:** Do not end messages with "LoamLabs Lead Tech" or your name. Just stop talking.
-- **NO FLUFF:** Get straight to the answer.
+**YOUR PERSONALITY:**
+- Professional, technical, direct, and "down to earth."
+- Identity: "LoamLabs Automated Lead Tech".
 
 **PROTOCOL:**
 1. **ANALYZE:** Look at the user's query.
-2. **GATEKEEPING:** If "Hubs" are requested without Position, ask "Front or Rear?" immediately.
-3. **SEARCH:** Use the tool.
-4. **REPORT:** List the items found.
-5. **FOLLOW UP:** Always end with a relevant question (e.g. "What axle standard do you need?").
+2. **GATEKEEPING (MANDATORY):** 
+   - If User wants **HUBS**: You MUST know **Position** (Front/Rear) AND **Axle Standard** (e.g. Boost, 148) before searching.
+   - If specs are missing, Ask clarifying questions immediately. Do not search yet.
+3. **SEARCH:** Use the tool only when you have specific details.
+4. **REPORT:** Summarize findings concisely.
 
 **LEAD TIME RULES:** 
 - In Stock = "Ready to ship"
@@ -134,8 +134,6 @@ async function lookupProductInfo(query: string) {
       }
     });
 
-    // --- CLEAN OUTPUT FOR SAFETY NET ---
-    // We only return the pure list now. No system instructions leaking to the user.
     return products.slice(0, 5).join("\n");
 
   } catch (error) {
@@ -195,17 +193,34 @@ export default async function handler(req: any, res: any) {
             q = String(q).trim();
             const qLower = q.toLowerCase();
 
-            // GATEKEEPER
+            // --- MULTI-STAGE GATEKEEPER ---
             const isHubRequest = qLower.includes("hub");
+            
+            // Gate 1: Position
             const hasPosition = qLower.includes("front") || qLower.includes("rear") || qLower.includes("pair") || qLower.includes("set");
             const contextPosition = buildContext?.position;
 
-            if (isHubRequest && !hasPosition && !contextPosition) {
-                console.log("[Tool] Intercepted Vague Query.");
-                toolActionTaken = "ask_clarification";
-                return `[SYSTEM INSTRUCTION]: Stop. Ask "Front or Rear?".`;
+            // Gate 2: Axle Standard (New)
+            // Look for common axle terms: 100, 110, 142, 148, 157, Boost, Super, DH
+            const hasAxle = qLower.match(/100|110|135|142|148|150|157|boost|super|dh/i);
+            const contextAxle = buildContext?.axle_spacing;
+
+            // Logic: If Hub request...
+            if (isHubRequest) {
+                // 1. Check Position
+                if (!hasPosition && !contextPosition) {
+                    toolActionTaken = "ask_position";
+                    return `[SYSTEM]: Stop. Ask "Front or Rear?".`;
+                }
+                // 2. Check Axle (Only if position is settled)
+                if (!hasAxle && !contextAxle) {
+                    console.log("[Tool] Position found, but Axle missing. Blocking Search.");
+                    toolActionTaken = "ask_axle";
+                    return `[SYSTEM]: Stop. Ask "What axle spacing? (e.g. Boost, 12x148)".`;
+                }
             }
 
+            // --- SEARCH ---
             toolActionTaken = "search";
             const info = await lookupProductInfo(q);
             allToolOutputs.push(info);
@@ -231,18 +246,17 @@ export default async function handler(req: any, res: any) {
         }
     }
 
-    // --- CLEAN SAFETY NET with AUTO-QUESTION ---
+    // --- SAFETY NET ---
     if (!hasSentText) {
-      if (toolActionTaken === 'ask_clarification') {
+      if (toolActionTaken === 'ask_position') {
           res.write("I can check that for you. Are you looking for a Front or Rear hub?");
+      } else if (toolActionTaken === 'ask_axle') {
+          // New fallback for the second gate
+          res.write("Got it. What axle spacing do you need? (e.g. Boost 15x110, 12x148, SuperBoost)");
       } else if (allToolOutputs.length > 0) {
           console.log("AI was silent. Using Clean Safety Net.");
-          
-          // Print the data
           res.write(`I found the following options:\n\n${allToolOutputs.join("\n\n")}`);
-          
-          // Force a follow-up question
-          res.write("\n\nDo any of these axle standards (e.g. Boost, 15x110) match your frame?");
+          res.write("\n\nDo any of these match your frame?");
       } else {
           res.write("I'm checking the system... could you specify if you need a Front or Rear hub?");
       }
