@@ -127,9 +127,8 @@ export default async function handler(req: any, res: any) {
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
     const result = await streamText({
-      // 1. Use the working model alias
-      model: google('gemini-flash-latest', {
-        // 2. CRITICAL: Disable all safety filters so "Hydra" isn't blocked
+      // SWITCHING TO GEMINI 2.0 (Using the 'exp' alias from your diagnostic logs)
+      model: google('gemini-2.0-flash-exp', {
         safetySettings: [
             { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
             { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
