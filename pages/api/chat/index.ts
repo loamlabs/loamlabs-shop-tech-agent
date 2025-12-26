@@ -10,8 +10,7 @@ export const config = {
   runtime: 'nodejs',
 };
 
-const STANDARD_SHOP_BUILD_DAYS = 5;
-const SEARCH_LIMIT = 100;
+const SEARCH_LIMIT = 100; // Need a large pool to filter correctly
 
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
@@ -21,9 +20,9 @@ You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 - Identity: "LoamLabs Automated Lead Tech".
 
 **PROTOCOL:**
-1. **ANALYZE:** Look at the user's query. If they ask for "Front and Rear", you may need to search twice or search broadly.
-2. **SEARCH SIMPLY:** Use ONLY the core Brand or Model name (e.g. "Hydra").
-3. **REPORT:** Summarize the results clearly.
+1. **ANALYZE:** Look at the user's query.
+2. **SEARCH:** Use the tool to check stock.
+3. **REPORT:** Summarize the results. If you found both Front and Rear options, mention both.
 
 **LEAD TIME RULES:** 
 - In Stock = "Ready to ship"
@@ -33,43 +32,21 @@ You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 The user's current selections are injected below.
 `;
 
-// Helper: Score products based on how many query keywords they match
-function sortProductsByRelevance(products: any[], query: string) {
-  const keywords = query.toLowerCase().split(' ').filter(k => k.length > 2); 
+async function lookupProductInfo(query: string, rawOriginalQuery: string) {
+  // 1. DETECT INTENT
+  const lowerQ = rawOriginalQuery.toLowerCase();
+  const wantsFront = lowerQ.includes('front');
+  const wantsRear = lowerQ.includes('rear');
+  const wantsHub = lowerQ.includes('hub');
   
-  return products.map(p => {
-    let score = 0;
-    const title = p.title.toLowerCase();
-    const tags = p.tags.join(' ').toLowerCase();
-    
-    // STRICT FILTER: If the search term isn't in the title/tags, kill it.
-    // We check against the first significant keyword (e.g., "Hope")
-    if (keywords.length > 0 && !title.includes(keywords[0]) && !tags.includes(keywords[0])) {
-        return { product: p, score: -9999 };
-    }
+  // Default to "Both" if neither is specified
+  const showFront = wantsFront || !wantsRear;
+  const showRear = wantsRear || !wantsFront;
 
-    if (title.includes(query.toLowerCase())) score += 50;
-
-    keywords.forEach(word => {
-      if (title.includes(word)) score += 10;
-      if (tags.includes(word)) score += 5;
-    });
-
-    if (query.toLowerCase().includes('hub') && !tags.includes('component:hub')) score -= 100;
-
-    return { product: p, score };
-  })
-  .filter(item => item.score > -100) // Remove the bad matches
-  .sort((a, b) => b.score - a.score)
-  .map(item => item.product);
-}
-
-async function lookupProductInfo(query: string) {
-  // CLEAN THE QUERY: Remove Position/Type words to find the BRAND/MODEL
-  // e.g. "Front Hope Hub" -> "Hope"
-  const cleanQuery = query.replace(/\b(front|rear|hub|hubs|wheel|wheels|set|pair|stock|available|in)\b/gi, '').trim();
+  // 2. CLEAN QUERY (Strip Position words to find the Brand)
+  const cleanQuery = query.replace(/\b(front|rear|hub|hubs|wheel|wheels|set|pair|stock|available|in|and)\b/gi, '').trim();
   
-  console.log(`[Tool] Searching Shopify for: "${cleanQuery}" (Original: "${query}")`);
+  console.log(`[Tool] Searching for Brand/Model: "${cleanQuery}" (Intent: F=${showFront}, R=${showRear})`);
   
   try {
     const adminResponse = await fetch(`https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-04/graphql.json`, {
@@ -103,27 +80,43 @@ async function lookupProductInfo(query: string) {
                 }
               }
             `,
-            // Search using the CLEANED query (Brand/Model only)
             variables: { query: cleanQuery } 
         })
     });
 
     const data = await adminResponse.json();
-    
-    if (!data.data || !data.data.products) {
-        return "Search failed.";
-    }
+    if (!data.data || !data.data.products) return "Search failed.";
     
     let rawProducts = data.data.products.edges.map((e: any) => e.node);
-    console.log(`[Shopify] Broad Search Found: ${rawProducts.length} items`);
-
-    // Sort using the ORIGINAL query (so "Front" sorts to top if asked for)
-    // But passing the clean query as the "Strict Keyword" to enforce Brand matching
-    const sortedProducts = sortProductsByRelevance(rawProducts, cleanQuery);
     
-    if (sortedProducts.length === 0) return "No products found matching that query.";
+    // 3. STRICT FILTERING
+    const filtered = rawProducts.filter((p: any) => {
+        const title = p.title.toLowerCase();
+        const tags = p.tags.map(t => t.toLowerCase());
 
-    const products = sortedProducts.map((p: any) => {
+        // A. Wheelset Filter: If user wants "Hub", discard non-hubs
+        if (wantsHub && !tags.includes('component:hub')) return false;
+
+        // B. Brand Match: Title must contain the search term (e.g. "Hope")
+        if (!title.includes(cleanQuery.toLowerCase())) return false;
+
+        return true;
+    });
+
+    // 4. SEPARATE INTO BUCKETS
+    const frontItems = filtered.filter(p => p.title.toLowerCase().includes('front'));
+    const rearItems = filtered.filter(p => p.title.toLowerCase().includes('rear'));
+
+    // 5. BUILD THE RESULT LIST
+    let finalSelection = [];
+
+    if (showFront) finalSelection.push(...frontItems.slice(0, 4)); // Take top 4 Fronts
+    if (showRear) finalSelection.push(...rearItems.slice(0, 4));   // Take top 4 Rears
+
+    if (finalSelection.length === 0) return "No products found matching those specs.";
+
+    // 6. FORMAT OUTPUT
+    const formatted = finalSelection.map((p: any) => {
       const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 7;
       const inStockVariants = [];
       const specialOrderVariants = [];
@@ -141,16 +134,14 @@ async function lookupProductInfo(query: string) {
       if (inStockVariants.length > 0) {
           return `• ${p.title} | IN STOCK: ${inStockVariants.join(', ')}`;
       } else if (specialOrderVariants.length > 0) {
+          // NO EXTRA 5 DAYS ADDED
           return `• ${p.title} | Special Order (~${rawLeadTime} days)`;
       } else {
           return `• ${p.title} | Sold Out`;
       }
     });
 
-    const topResults = products.slice(0, 5);
-    console.log(`[Tool] Returning top 5 sorted results.`);
-    
-    return topResults.join("\n");
+    return formatted.join("\n");
 
   } catch (error) {
     console.error("Shopify Lookup Error:", error);
@@ -174,8 +165,7 @@ export default async function handler(req: any, res: any) {
     let finalSystemPrompt = SYSTEM_PROMPT + `\n[CONTEXT]: ${JSON.stringify(buildContext?.components || {})}`;
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
-    // Global variable to accumulate results from multiple tool calls
-    let allToolOutputs = [];
+    let capturedToolOutput = "";
 
     const result = await streamText({
       model: google('gemini-flash-latest', {
@@ -200,17 +190,12 @@ export default async function handler(req: any, res: any) {
           }),
           execute: async (args) => {
             console.log("[Tool Debug] Raw Args:", JSON.stringify(args));
-            
-            // Extract the meaningful query from whatever the AI sent
             let q = args.query;
             if (!q || typeof q !== 'string') q = Object.values(args).join(" ");
-            if (!q) q = "undefined";
             
-            const info = await lookupProductInfo(String(q));
-            
-            // APPEND result to global list instead of overwriting
-            allToolOutputs.push(`Results for "${q}":\n${info}`);
-            
+            // Pass the RAW ORIGINAL query to the helper so we can detect "Front" and "Rear"
+            const info = await lookupProductInfo(String(q), String(q));
+            capturedToolOutput = info; 
             return info;
           },
         }),
@@ -226,8 +211,6 @@ export default async function handler(req: any, res: any) {
     let hasSentText = false;
 
     for await (const part of result.fullStream) {
-        if (part.type !== 'text-delta') console.log("Stream Part:", part.type);
-
         const textContent = part.textDelta || part.text || part.content || "";
         if (part.type === 'text-delta' && typeof textContent === 'string' && textContent.length > 0) {
             res.write(textContent);
@@ -236,11 +219,11 @@ export default async function handler(req: any, res: any) {
     }
 
     if (!hasSentText) {
-      if (allToolOutputs.length > 0) {
-        console.log("AI was silent. Using Accumulated Safety Net.");
-        res.write(allToolOutputs.join("\n\n"));
+      if (capturedToolOutput) {
+        console.log("AI was silent. Using Safety Net.");
+        res.write(`I found these items:\n\n${capturedToolOutput}`);
       } else {
-        res.write("I'm checking, but I need a bit more detail. Are you looking for Front or Rear?");
+        res.write("I need a bit more detail. Are you looking for Front or Rear hubs?");
       }
     }
 
