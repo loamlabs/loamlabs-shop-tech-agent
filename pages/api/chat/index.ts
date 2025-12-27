@@ -10,23 +10,27 @@ export const config = {
   runtime: 'nodejs',
 };
 
-const STANDARD_SHOP_BUILD_DAYS = 5;
 const SEARCH_LIMIT = 100;
+
+// --- KNOWLEDGE BASE ---
+// This allows the code to "understand" axles without asking the AI
+const AXLE_MAP = {
+  front: ['15x110', '15x100', '12x100', '20x110', '110x15', '100x15', '100x12', 'boost front'],
+  rear: ['12x148', '12x157', '12x142', '12x150', '135', '148', '157', '150', '142', 'superboost', 'boost rear']
+};
 
 const SYSTEM_PROMPT = `
 You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 
-**YOUR PERSONALITY:**
-- Professional, technical, direct, and "down to earth."
-- Identity: "LoamLabs Automated Lead Tech".
+**YOUR PERSONA:**
+- Professional, technical, direct.
+- **NO SIGN-OFFS:** Do not end messages with your name. Just stop talking.
 
 **PROTOCOL:**
 1. **ANALYZE:** Look at the user's query.
-2. **GATEKEEPING (MANDATORY):** 
-   - If User wants **HUBS**: You MUST know **Position** (Front/Rear) AND **Axle Standard** (e.g. Boost, 148) before searching.
-   - If specs are missing, Ask clarifying questions immediately. Do not search yet.
-3. **SEARCH:** Use the tool only when you have specific details.
-4. **REPORT:** Summarize findings concisely.
+2. **GATEKEEPING:** If "Hubs" are requested without Position or Axle, ask "Front or Rear?" immediately.
+3. **SEARCH:** Use the tool.
+4. **REPORT:** List the items found concisely.
 
 **LEAD TIME RULES:** 
 - In Stock = "Ready to ship"
@@ -35,6 +39,18 @@ You are the **LoamLabs Lead Tech**, an expert AI wheel building assistant.
 **CONTEXT:**
 The user's current selections are injected below.
 `;
+
+// Helper: Infer Position from Axle String
+function inferPositionFromQuery(query: string) {
+  const q = query.toLowerCase();
+  for (const token of AXLE_MAP.front) {
+    if (q.includes(token)) return 'Front';
+  }
+  for (const token of AXLE_MAP.rear) {
+    if (q.includes(token)) return 'Rear';
+  }
+  return null; // Could not infer
+}
 
 // Helper: Score products based on relevance
 function sortProductsByRelevance(products: any[], query: string) {
@@ -45,14 +61,17 @@ function sortProductsByRelevance(products: any[], query: string) {
     const title = p.title.toLowerCase();
     const tags = p.tags.join(' ').toLowerCase();
     
+    // Strict Filter: If keyword is "Rear", title MUST have "Rear"
     if (keywords.includes('rear') && !title.includes('rear')) return { product: p, score: -999 };
     if (keywords.includes('front') && !title.includes('front')) return { product: p, score: -999 };
 
     if (title.includes(query.toLowerCase())) score += 50;
+    
     keywords.forEach(word => {
       if (title.includes(word)) score += 10;
       if (tags.includes(word)) score += 5;
     });
+    
     if (query.toLowerCase().includes('hub') && !tags.includes('component:hub')) score -= 100;
 
     return { product: p, score };
@@ -63,7 +82,8 @@ function sortProductsByRelevance(products: any[], query: string) {
 }
 
 async function lookupProductInfo(query: string) {
-  const cleanQuery = query.replace(/\b(front|rear|hub|hubs|wheel|wheels|set|pair|stock|available|in|and)\b/gi, '').trim();
+  // CLEAN THE QUERY (Keep numbers/axles, remove filler words)
+  const cleanQuery = query.replace(/\b(front|rear|hub|hubs|wheel|wheels|set|pair|stock|available|in|and|have|do|you)\b/gi, '').trim();
   console.log(`[Tool] Searching Shopify for Brand: "${cleanQuery}" (Context: "${query}")`);
   
   try {
@@ -98,7 +118,7 @@ async function lookupProductInfo(query: string) {
                 }
               }
             `,
-            variables: { query: cleanQuery } 
+            variables: { query: cleanQuery.split(' ')[0] } // Search broad, filter local
         })
     });
 
@@ -106,9 +126,11 @@ async function lookupProductInfo(query: string) {
     if (!data.data || !data.data.products) return "Search failed.";
     
     let rawProducts = data.data.products.edges.map((e: any) => e.node);
+    
+    // Sort using the FULL original query to capture "Front/Rear" nuances
     const sortedProducts = sortProductsByRelevance(rawProducts, query);
     
-    if (sortedProducts.length === 0) return `No products found matching "${query}".`;
+    if (sortedProducts.length === 0) return `No products found matching "${cleanQuery}".`;
 
     const products = sortedProducts.map((p: any) => {
       const rawLeadTime = p.leadTime ? parseInt(p.leadTime.value) : 7;
@@ -158,7 +180,7 @@ export default async function handler(req: any, res: any) {
     let finalSystemPrompt = SYSTEM_PROMPT + `\n[CONTEXT]: ${JSON.stringify(buildContext?.components || {})}`;
     if (isAdmin) finalSystemPrompt += `\n\n**ADMIN DEBUG MODE:** Show raw data if asked.`;
 
-    let allToolOutputs = [];
+    let capturedToolOutput = "";
     let toolActionTaken = "none";
 
     const result = await streamText({
@@ -189,41 +211,33 @@ export default async function handler(req: any, res: any) {
             if (args.query) q = args.query;
             else if (args.product_name) q = args.product_name;
             else q = Object.values(args).join(" ");
-            
             q = String(q).trim();
             const qLower = q.toLowerCase();
 
-            // --- MULTI-STAGE GATEKEEPER ---
+            // --- SMART GATEKEEPER ---
             const isHubRequest = qLower.includes("hub");
-            
-            // Gate 1: Position
             const hasPosition = qLower.includes("front") || qLower.includes("rear") || qLower.includes("pair") || qLower.includes("set");
             const contextPosition = buildContext?.position;
+            
+            // Check for Axle Specs in the query (Inference)
+            const inferredPosition = inferPositionFromQuery(qLower);
 
-            // Gate 2: Axle Standard (New)
-            // Look for common axle terms: 100, 110, 142, 148, 157, Boost, Super, DH
-            const hasAxle = qLower.match(/100|110|135|142|148|150|157|boost|super|dh/i);
-            const contextAxle = buildContext?.axle_spacing;
-
-            // Logic: If Hub request...
-            if (isHubRequest) {
-                // 1. Check Position
-                if (!hasPosition && !contextPosition) {
-                    toolActionTaken = "ask_position";
-                    return `[SYSTEM]: Stop. Ask "Front or Rear?".`;
-                }
-                // 2. Check Axle (Only if position is settled)
-                if (!hasAxle && !contextAxle) {
-                    console.log("[Tool] Position found, but Axle missing. Blocking Search.");
-                    toolActionTaken = "ask_axle";
-                    return `[SYSTEM]: Stop. Ask "What axle spacing? (e.g. Boost, 12x148)".`;
-                }
+            // If user said "15x110", we KNOW it's front. Don't block.
+            if (isHubRequest && !hasPosition && !contextPosition && !inferredPosition) {
+                console.log("[Tool] Intercepted Vague Query.");
+                toolActionTaken = "ask_clarification";
+                return `[SYSTEM INSTRUCTION]: Stop. Ask "Front or Rear?".`;
             }
 
-            // --- SEARCH ---
+            // If we inferred position from axle, append it to the search
+            if (inferredPosition && !hasPosition) {
+                console.log(`[Tool] Inferred Position: ${inferredPosition} from axle.`);
+                q += ` ${inferredPosition}`;
+            }
+
             toolActionTaken = "search";
             const info = await lookupProductInfo(q);
-            allToolOutputs.push(info);
+            capturedToolOutput = info;
             return info;
           },
         }),
@@ -246,17 +260,12 @@ export default async function handler(req: any, res: any) {
         }
     }
 
-    // --- SAFETY NET ---
     if (!hasSentText) {
-      if (toolActionTaken === 'ask_position') {
+      if (toolActionTaken === 'ask_clarification') {
           res.write("I can check that for you. Are you looking for a Front or Rear hub?");
-      } else if (toolActionTaken === 'ask_axle') {
-          // New fallback for the second gate
-          res.write("Got it. What axle spacing do you need? (e.g. Boost 15x110, 12x148, SuperBoost)");
-      } else if (allToolOutputs.length > 0) {
+      } else if (capturedToolOutput) {
           console.log("AI was silent. Using Clean Safety Net.");
-          res.write(`I found the following options:\n\n${allToolOutputs.join("\n\n")}`);
-          res.write("\n\nDo any of these match your frame?");
+          res.write(`I found the following options:\n\n${capturedToolOutput}`);
       } else {
           res.write("I'm checking the system... could you specify if you need a Front or Rear hub?");
       }
