@@ -2,6 +2,7 @@ import { Redis } from '@upstash/redis';
 import * as dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
+import { pickFreehub } from './freehub-pick';
 
 dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
 
@@ -94,6 +95,7 @@ query getProducts($cursor: String) {
               # --- D. ENGINEERING ---
               weight_g_var: metafield(namespace: "custom", key: "weight_g") { value }
               erd: metafield(namespace: "custom", key: "rim_erd") { value }
+              freehub_list_var: metafield(namespace: "custom", key: "freehub") { value }
               
               # --- E. LOGISTICS ---
               lead_time_var: metafield(namespace: "custom", key: "lead_time_days") { value }
@@ -197,6 +199,9 @@ function flattenDatabase(products: any[]) {
       const leadTime = parseInt(variant.lead_time_var?.value || p.lead_time_prod?.value || "7");
       const weight = parseFloat(variant.weight_g_var?.value || p.weight_g_product?.value || "0");
 
+      // Variant list first; the product list is only the fallback (never merged).
+      const freehub = pickFreehub(variant.freehub_list_var?.value, baseData.freehub_compatibility);
+
       flatList.push({
         id: variant.id,
         title: variant.title === "Default Title" ? p.title : `${p.title} - ${variant.title}`,
@@ -205,6 +210,7 @@ function flattenDatabase(products: any[]) {
         policy: variant.inventoryPolicy,
         lead_time: leadTime,
         ...baseData,
+        freehub_compatibility: freehub,
         color: color,
         holes: holes,
         position: variant.position?.value || "",
