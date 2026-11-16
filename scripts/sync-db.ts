@@ -116,7 +116,7 @@ async function fetchAllProducts() {
   console.log("🚀 Starting Data Sync (Fetching All)...");
 
   while (hasNext) {
-    const response = await fetch(`https://${SHOP_DOMAIN}/admin/api/2024-04/graphql.json`, {
+    const response: any = await fetch(`https://${SHOP_DOMAIN}/admin/api/2024-04/graphql.json`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -128,7 +128,7 @@ async function fetchAllProducts() {
       })
     });
 
-    const json = await response.json();
+    const json: any = await response.json();
     
     if (json.errors) {
       console.warn("\n⚠️ API Error. Retrying...");
@@ -136,7 +136,7 @@ async function fetchAllProducts() {
       continue; 
     }
 
-    const data = json.data.products;
+    const data: any = json.data.products;
     
     if (data.edges.length > 0) {
         allProducts.push(...data.edges.map((e: any) => e.node));
