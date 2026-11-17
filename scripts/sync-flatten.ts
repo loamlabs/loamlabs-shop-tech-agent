@@ -48,7 +48,8 @@ export function flattenDatabase(products: any[]) {
       });
 
       const leadTime = parseInt(variant.lead_time_var?.value || p.lead_time_prod?.value || "7");
-      const weight = parseFloat(variant.weight_g_var?.value || p.weight_g_product?.value || "0");
+      // Variant weight first; a spoke product's base weight (custom.spoke_base_weight_g, for a 260 mm spoke) second; the old product weight_g last (cleared on spokes on Nov 17 2026).
+      const weight = parseFloat(variant.weight_g_var?.value || p.spoke_base_weight_g?.value || p.weight_g_product?.value || "0");
 
       // Variant list first; the product list is only the fallback (never merged).
       const freehub = pickFreehub(variant.freehub_list_var?.value, baseData.freehub_compatibility);

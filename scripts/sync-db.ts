@@ -91,6 +91,7 @@ query getProducts($cursor: String) {
         
         # --- D. ENGINEERING ---
         weight_g_product: metafield(namespace: "custom", key: "weight_g") { value }
+        spoke_base_weight_g: metafield(namespace: "custom", key: "spoke_base_weight_g") { value }
         hub_type: metafield(namespace: "custom", key: "hub_type") { value }
         freehub_list: metafield(namespace: "custom", key: "freehub") { value }
         

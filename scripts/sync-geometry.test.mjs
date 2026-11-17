@@ -55,3 +55,18 @@ test('products without a component tag are still dropped; weight stays variant f
   const p = product({ variants: { edges: [{ node: variant({ weight_g_var: m(300) }) }] } });
   assert.equal(flattenDatabase([p])[0].weight, 300);
 });
+
+test('spoke weight: the variant weight wins, then the product\'s spoke_base_weight_g, then the old product weight_g; a hub without a base weight behaves as before; nothing is mixed up', () => {
+  const spoke = (over = {}, vover = {}) => product({ tags: ['component:spoke'], weight_g_product: null, spoke_base_weight_g: null, variants: { edges: [{ node: variant({ weight_g_var: null, ...vover }) }] }, ...over });
+  const w = (p) => flattenDatabase([p])[0].weight;
+  assert.equal(w(spoke({ spoke_base_weight_g: m(5.95) })), 5.95);                                                      // cleared product weight_g: the base weight is used (was 0 before this fix)
+  assert.equal(w(spoke({ spoke_base_weight_g: m(5.95) }, { weight_g_var: m(6.2) })), 6.2);                              // a variant's own weight still wins
+  assert.equal(w(spoke({ spoke_base_weight_g: m(5.95), weight_g_product: m(7) })), 5.95);                               // base before the old product value
+  assert.equal(w(spoke({ weight_g_product: m(7) })), 7);                                                                // no base weight: the old product value as before
+  assert.equal(w(spoke()), 0);                                                                                          // nothing anywhere: 0, as before
+  assert.equal(w(product({ spoke_base_weight_g: null, weight_g_product: m(300), variants: { edges: [{ node: variant({ weight_g_var: null }) }] } })), 300);   // a hub: unchanged
+});
+test('the product query asks for spoke_base_weight_g next to the old weight (source check of sync-db.ts)', async () => {
+  const fs = await import('node:fs'); const src = fs.readFileSync(new URL('./sync-db.ts', import.meta.url), 'utf8');
+  assert.match(src, /spoke_base_weight_g: metafield\(namespace: "custom", key: "spoke_base_weight_g"\)/); assert.match(src, /weight_g_product: metafield\(namespace: "custom", key: "weight_g"\)/);
+});
