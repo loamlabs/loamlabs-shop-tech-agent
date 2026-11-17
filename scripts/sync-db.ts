@@ -2,7 +2,8 @@ import { Redis } from '@upstash/redis';
 import * as dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
-import { pickFreehub } from './freehub-pick';
+import { flattenDatabase, geometryConflictProducts } from './sync-flatten.ts';
+import { completeVariants } from './sync-paging.ts';
 
 dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
 
@@ -21,10 +22,56 @@ const redis = new Redis({
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Shopify reserves the REQUESTED cost of a query and refills 100 points a second: wait until the bucket holds that much, so the next page is not throttled.
+async function paceByCost(json: any) {
+  const c = json?.extensions?.cost;
+  if (!c || !c.throttleStatus) return;
+  const need = (c.requestedQueryCost || 0) - (c.throttleStatus.currentlyAvailable || 0);
+  if (need > 0) await sleep(Math.ceil((need / (c.throttleStatus.restoreRate || 100)) * 1000) + 100);
+}
+
+// Every field read from a variant (shared by the main query and the extra variant pages).
+const VARIANT_FIELDS = `
+              id
+              title
+              sku
+              price
+              inventoryQuantity
+              inventoryPolicy
+              
+              selectedOptions {
+                name
+                value
+              }
+
+              # --- C. CRITICAL FILTERING ---
+              position: metafield(namespace: "custom", key: "wheel_spec_position") { value }
+              axle: metafield(namespace: "custom", key: "wheel_spec_hub_spacing") { value }
+              brake: metafield(namespace: "custom", key: "wheel_spec_brake_interface") { value }
+              size: metafield(namespace: "custom", key: "wheel_spec_rim_size") { value }
+              width: metafield(namespace: "custom", key: "wheel_spec_internal_width_mm") { value }
+              
+              # --- D. ENGINEERING ---
+              weight_g_var: metafield(namespace: "custom", key: "weight_g") { value }
+              erd: metafield(namespace: "custom", key: "rim_erd") { value }
+              freehub_list_var: metafield(namespace: "custom", key: "freehub") { value }
+
+              # Hub geometry on the variant (a master can differ per spacing); the product value is the fallback
+              flange_r_dia_var: metafield(namespace: "custom", key: "hub_flange_diameter_right") { value }
+              flange_l_dia_var: metafield(namespace: "custom", key: "hub_flange_diameter_left") { value }
+              flange_r_off_var: metafield(namespace: "custom", key: "hub_flange_offset_right") { value }
+              flange_l_off_var: metafield(namespace: "custom", key: "hub_flange_offset_left") { value }
+              sp_offset_r_var: metafield(namespace: "custom", key: "hub_sp_offset_spoke_hole_right") { value }
+              sp_offset_l_var: metafield(namespace: "custom", key: "hub_sp_offset_spoke_hole_left") { value }
+              
+              # --- E. LOGISTICS ---
+              lead_time_var: metafield(namespace: "custom", key: "lead_time_days") { value }
+`;
+
 // CHANGED: Removed the 'query' parameter to fetch EVERYTHING first
 const QUERY = `
 query getProducts($cursor: String) {
-  products(first: 20, after: $cursor) {
+  products(first: 10, after: $cursor) {
     pageInfo {
       hasNextPage
       endCursor
@@ -71,35 +118,10 @@ query getProducts($cursor: String) {
         }
 
         variants(first: 50) {
+          pageInfo { hasNextPage endCursor }
           edges {
             node {
-              id
-              title
-              sku
-              price
-              inventoryQuantity
-              inventoryPolicy
-              
-              selectedOptions {
-                name
-                value
-              }
-
-              # --- C. CRITICAL FILTERING ---
-              position: metafield(namespace: "custom", key: "wheel_spec_position") { value }
-              axle: metafield(namespace: "custom", key: "wheel_spec_hub_spacing") { value }
-              brake: metafield(namespace: "custom", key: "wheel_spec_brake_interface") { value }
-              size: metafield(namespace: "custom", key: "wheel_spec_rim_size") { value }
-              width: metafield(namespace: "custom", key: "wheel_spec_internal_width_mm") { value }
-              
-              # --- D. ENGINEERING ---
-              weight_g_var: metafield(namespace: "custom", key: "weight_g") { value }
-              erd: metafield(namespace: "custom", key: "rim_erd") { value }
-              freehub_list_var: metafield(namespace: "custom", key: "freehub") { value }
-              
-              # --- E. LOGISTICS ---
-              lead_time_var: metafield(namespace: "custom", key: "lead_time_days") { value }
-            }
+${VARIANT_FIELDS}            }
           }
         }
       }
@@ -107,6 +129,35 @@ query getProducts($cursor: String) {
   }
 }
 `;
+
+const VARIANT_PAGE_QUERY = `
+query getVariantPage($id: ID!, $cursor: String) {
+  product(id: $id) {
+    variants(first: 50, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      edges {
+        node {
+${VARIANT_FIELDS}        }
+      }
+    }
+  }
+}
+`;
+
+async function fetchVariantPage(productId: string, cursor: string) {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const response: any = await fetch(`https://${SHOP_DOMAIN}/admin/api/2024-04/graphql.json`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': ACCESS_TOKEN! },
+      body: JSON.stringify({ query: VARIANT_PAGE_QUERY, variables: { id: productId, cursor } })
+    });
+    const json: any = await response.json();
+    if (json.errors || !json.data?.product) { await sleep(2000); continue; }
+    await paceByCost(json);
+    return json.data.product.variants;
+  }
+  throw new Error(`could not read more variants of ${productId}`);
+}
 
 async function fetchAllProducts() {
   let allProducts = [];
@@ -139,92 +190,23 @@ async function fetchAllProducts() {
     const data: any = json.data.products;
     
     if (data.edges.length > 0) {
-        allProducts.push(...data.edges.map((e: any) => e.node));
+        const nodes = data.edges.map((e: any) => e.node);
+        for (const node of nodes) {
+          // a product with more than 50 variants (a hub master, the Industry Nine SYSTEM front) is read to the end
+          if (node.variants?.pageInfo?.hasNextPage) await completeVariants(node, fetchVariantPage);
+        }
+        allProducts.push(...nodes);
     }
 
     cursor = data.pageInfo.endCursor;
     hasNext = data.pageInfo.hasNextPage;
     process.stdout.write("."); 
     await sleep(250); 
+    await paceByCost(json);
   }
 
   console.log(`\n📦 Fetched ${allProducts.length} Total Products. Filtering...`);
   return allProducts;
-}
-
-function flattenDatabase(products: any[]) {
-  const flatList: any[] = [];
-
-  products.forEach(p => {
-    // --- JAVASCRIPT FILTER ---
-    // Only keep items that have a tag starting with "component:"
-    // e.g., "component:rim", "component:hub"
-    const hasComponentTag = p.tags.some((t: string) => t.toLowerCase().startsWith('component:'));
-    
-    if (!hasComponentTag) {
-        // Skip this product (it's likely a wheelset, t-shirt, or other item)
-        return; 
-    }
-
-    const baseData = {
-      product_id: p.id,
-      handle: p.handle,
-      model: p.model?.value || p.title,
-      tags: p.tags,
-      hub_type: p.hub_type?.value,
-      freehub_compatibility: p.freehub_list?.value ? JSON.parse(p.freehub_list.value) : [],
-      lacing_policy: p.lacing_policy?.value,
-      flange_r_dia: parseFloat(p.flange_r_dia?.value || 0),
-      flange_l_dia: parseFloat(p.flange_l_dia?.value || 0),
-      flange_r_off: parseFloat(p.flange_r_off?.value || 0),
-      flange_l_off: parseFloat(p.flange_l_off?.value || 0),
-      sp_offset_r: parseFloat(p.sp_offset_r?.value || 0),
-      sp_offset_l: parseFloat(p.sp_offset_l?.value || 0),
-      rim_tension: parseFloat(p.rim_tension?.value || 0),
-      rim_depth: parseFloat(p.rim_depth_prod?.value || 0),
-    };
-
-    p.variants.edges.forEach((v: any) => {
-      const variant = v.node;
-      
-      let color = "";
-      let holes = "";
-      
-      variant.selectedOptions.forEach((opt: any) => {
-        const name = opt.name.toLowerCase();
-        if (name.includes('color') || name.includes('colour')) color = opt.value;
-        if (name.includes('hole') || name.includes('count')) holes = opt.value;
-      });
-
-      const leadTime = parseInt(variant.lead_time_var?.value || p.lead_time_prod?.value || "7");
-      const weight = parseFloat(variant.weight_g_var?.value || p.weight_g_product?.value || "0");
-
-      // Variant list first; the product list is only the fallback (never merged).
-      const freehub = pickFreehub(variant.freehub_list_var?.value, baseData.freehub_compatibility);
-
-      flatList.push({
-        id: variant.id,
-        title: variant.title === "Default Title" ? p.title : `${p.title} - ${variant.title}`,
-        price: variant.price,
-        stock: variant.inventoryQuantity,
-        policy: variant.inventoryPolicy,
-        lead_time: leadTime,
-        ...baseData,
-        freehub_compatibility: freehub,
-        color: color,
-        holes: holes,
-        position: variant.position?.value || "",
-        axle: variant.axle?.value || "",
-        brake: variant.brake?.value || "",
-        size: variant.size?.value || "",
-        width: variant.width?.value || "",
-        erd: parseFloat(variant.erd?.value || 0),
-        weight: weight
-      });
-    });
-  });
-
-  return flatList;
 }
 
 async function run() {
@@ -233,6 +215,13 @@ async function run() {
     const flatDb = flattenDatabase(rawProducts);
 
     console.log(`🧠 Generated ${flatDb.length} Master Records (Filtered).`);
+
+    // Hub products whose variant and product geometry disagree (the order webhook reads variant first: a stale product copy gives silent wrong lengths)
+    const conflicts = geometryConflictProducts(flatDb);
+    if (conflicts.length) {
+      console.warn(`⚠️ ${conflicts.length} product(s) have hub geometry on a variant that differs from the product value (review):`);
+      conflicts.slice(0, 25).forEach(c => console.warn(`   ${c.handle}: ${c.fields.join(', ')} (${c.variants} variants)`));
+    }
     
     if (flatDb.length === 0) {
         console.error("❌ Error: Filter removed all products. Check tags!");
